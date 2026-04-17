@@ -1,0 +1,17 @@
+# RAN Self-Healing ADK — Dependencies
+# =====================================
+# Install: pip install -r requirements.txt
+
+# Google Agent Development Kit (ADK)
+google-adk>=0.4.0
+
+# Google GenAI SDK (transitive via ADK, pinned for GCP compatibility)
+google-genai>=0.8.0
+
+# GCP client libraries (for production BigQuery / Spanner / Pub/Sub integration)
+google-cloud-bigquery>=3.0.0
+google-cloud-spanner>=3.0.0
+google-cloud-pubsub>=2.0.0
+
+# Utilities
+python-dotenv>=1.0.0
