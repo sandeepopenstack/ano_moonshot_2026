@@ -1,0 +1,76 @@
+How to deploy on Google ADK from Vertex AI Jupyter Notebook
+Open a terminal in your Jupyter environment (not a notebook cell — a real terminal). Run every command there.
+Step 1 — Verify your project structure
+ls
+# You should see:
+# app/  main.py  gnn_inference_provider.py  investigation_mock_output.py
+# execution_mock_output.py  requirements.txt  .env
+
+Step 2 — Set environment variables
+
+export GOOGLE_CLOUD_PROJECT=your-actual-project-id
+export GOOGLE_CLOUD_LOCATION=us-central1
+export GOOGLE_GENAI_USE_VERTEXAI=TRUE
+Also update your .env file with the same values:
+envGOOGLE_CLOUD_PROJECT=your-actual-project-id
+GOOGLE_CLOUD_LOCATION=us-central1
+GOOGLE_GENAI_USE_VERTEXAI=TRUE
+
+Step 3 — Install updated dependencies
+pip install -r requirements.txt
+
+Step 4 — Test locally first
+python main.py
+
+You should see the autonomous pipeline run end to end with either UC1 or UC2. If this works, you are ready to deploy.
+
+Step 5 — Enable GCP APIs (run once)
+gcloud services enable \
+  run.googleapis.com \
+  aiplatform.googleapis.com \
+  artifactregistry.googleapis.com \
+  --project=$GOOGLE_CLOUD_PROJECT
+
+Step 6 — Deploy to Cloud Run with ADK web UI
+Run this from inside your project folder:
+adk deploy cloud_run \
+  --project=$GOOGLE_CLOUD_PROJECT \
+  --region=us-central1 \
+  --service-name=ran-healing-adk \
+  --with-ui \
+  .
+This single command does everything — packages your code, builds a container, pushes it to Artifact Registry, deploys to Cloud Run, and serves the ADK web UI. It takes 3-5 minutes.
+
+Step 7 — Get your service URL
+gcloud run services describe ran-healing-adk \
+  --region=us-central1 \
+  --format='value(status.url)'
+
+This prints something like:
+https://ran-healing-adk-abc123-uc.a.run.app
+
+This URL is what you give to the other team (Investigation + Execution agents). They do not need an IP or port — this HTTPS URL is their endpoint.
+
+Step 8 — Open the web UI
+Open that URL in your browser. You will see the ADK developer UI showing your RanHealingOrchestrator. The pipeline runs autonomously — the GNN injects the anomaly, all agents fire in sequence, and you watch the full event chain in the UI.
+
+What to tell the other team
+Give them exactly this:
+Orchestrator URL  : https://ran-healing-adk-abc123-uc.a.run.app
+Agent card        : https://ran-healing-adk-abc123-uc.a.run.app/.well-known/agent.json
+
+Your Investigation Agent must:
+  - Accept our POST with the monitoring triage payload
+  - Return JSON matching investigation_mock_output.py shape
+
+Your Execution Agent must:
+  - Accept our POST with the TMF921 solution plan payload
+  - Return JSON matching execution_mock_output.py shape
+
+When your services are deployed, give us:
+  - Your Cloud Run URL for Investigation Agent
+  - Your Cloud Run URL for Execution Agent
+  - Auth token if required
+
+We will plug your URLs into investigation_client.py and execution_client.py
+and flip USE_MOCK=false — no other code changes needed on our side.
