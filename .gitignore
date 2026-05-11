@@ -4,3 +4,5 @@ __pycache__/
 .excalidraw.log
 excalidraw.log
 logs/
+dist/
+.adk/

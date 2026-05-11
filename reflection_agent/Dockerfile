@@ -1,14 +1,11 @@
 FROM python:3.12-slim
 
-WORKDIR /app
-
-COPY requirements.txt .
+WORKDIR /app/reflection_agent
+COPY . .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
-
+WORKDIR /app
 ENV AGENT_MODEL=gemini-2.5-flash
-
 EXPOSE 8000
 
-CMD ["adk", "web", "reflection_agent/"]
+CMD ["adk", "api_server", "--port=8000", "/app"]
