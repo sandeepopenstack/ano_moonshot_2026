@@ -1,2 +1,3 @@
 google-adk[vertexai]>=1.0.0
 requests>=2.31.0
+./ran_healing_shared-0.1.0-py3-none-any.whl

@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ran_healing_shared"
+version = "0.1.0"
+description = "Shared code for RAN Healing ADK agents"
+requires-python = ">=3.11"
+
+[tool.setuptools.packages.find]
+include = ["ran_healing_shared", "ran_healing_shared.*"]

@@ -1,6 +1,3 @@
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
 import os
 import uuid
 import logging
@@ -8,18 +5,18 @@ import requests
 from datetime import datetime, timezone
 from google.adk.tools import ToolContext
 
-from shared.events import (
+from ran_healing_shared.events import (
     EVT_FAILURE_NOTIFICATION,
     EVT_REFLEX_TRIAGE_READY,
     NETWORK_STATUS_KEY,
     publish_event,
     latest_key,
 )
-from shared.remediation_config import (
+from ran_healing_shared.remediation_config import (
     infer_domain,
     get_priority_from_gnn,
 )
-from gnn_inference_provider import prompt_gnn_engine
+from ran_healing_shared.gnn_inference_provider import prompt_gnn_engine
 
 
 _BRANCH_PRIORITY_LABEL = {0: "HIGH", 1: "MEDIUM", 2: "LOW"}
@@ -482,7 +479,7 @@ def perform_triage(tool_context: ToolContext) -> str:
         or round(impact_score * 10, 1)
     )
 
-    from shared.remediation_config import get_priority_flag, PRIORITY_FLAG_TO_EXTERNAL
+    from ran_healing_shared.remediation_config import get_priority_flag, PRIORITY_FLAG_TO_EXTERNAL
     priority_flag     = get_priority_flag(composite_score)
     priority_external = PRIORITY_FLAG_TO_EXTERNAL.get(priority_flag, "CRITICAL")
 

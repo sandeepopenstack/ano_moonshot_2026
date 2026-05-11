@@ -1,12 +1,9 @@
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
 import json
 import logging
 from datetime import datetime, timezone
 from google.adk.tools import ToolContext
 
-from shared.events import (
+from ran_healing_shared.events import (
     EVT_EXECUTION_COMPLETED,
     NETWORK_STATUS_KEY,
     consume_latest,
@@ -14,11 +11,11 @@ from shared.events import (
     make_reflection_result_event,
     make_failure_notification_event,
 )
-from shared.remediation_config import (
+from ran_healing_shared.remediation_config import (
     BASELINE_Z_SCORE,
     REFLECTION_CONFIG,
 )
-from gnn_inference_provider import generate_gnn_inference_event
+from ran_healing_shared.gnn_inference_provider import generate_gnn_inference_event
 
 
 def check_execution_result(tool_context: ToolContext) -> str:

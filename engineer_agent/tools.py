@@ -1,6 +1,3 @@
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
 import uuid
 import os
 import json
@@ -8,14 +5,14 @@ import logging
 from datetime import datetime, timezone
 from google.adk.tools import ToolContext
 
-from shared.events import (
+from ran_healing_shared.events import (
     EVT_DETECTIVE_RCA_CONFIRMED,
     NETWORK_STATUS_KEY,
     consume_latest,
     make_engineer_event,
     publish_event,
 )
-from shared.remediation_config import (
+from ran_healing_shared.remediation_config import (
     get_healing_actions,
     get_tilt_correction,
     normalize_root_cause,
@@ -396,7 +393,7 @@ def _build_branches(
                 "action_source":          "investigation",
             })
     elif rca["domain"] == "CROSS_DOMAIN":
-        from providers.detective_provider import _DOMAIN_DEFAULTS as _DD
+        from ran_healing_shared.providers.detective_provider import _DOMAIN_DEFAULTS as _DD
 
         branches = []
 

@@ -1,5 +1,4 @@
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import os
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -16,7 +15,7 @@ os.environ["GOOGLE_CLOUD_DISABLE_METRICS"] = "true"
 os.environ["SPANNER_ENABLE_METRICS"] = "false"
 os.environ["OTEL_PYTHON_DISABLED"] = "true"
 
-from shared.events import (
+from ran_healing_shared.events import (
     make_failure_notification_event,
     make_rca_confirmed_event,
     make_execution_completed_event,
@@ -26,9 +25,9 @@ from shared.events import (
     EVT_ENGINEER_READY,
     EVT_EXECUTION_COMPLETED,
 )
-from failure_injection_ms import build_trigger_event
-from providers.detective_provider import generate_detective_output
-from providers.execution_provider import generate_execution_output
+from ran_healing_shared.failure_injection_ms import build_trigger_event
+from ran_healing_shared.providers.detective_provider import generate_detective_output
+from ran_healing_shared.providers.execution_provider import generate_execution_output
 from reflex_agent.tools import call_gnn_engine, perform_triage, publish_triage
 from engineer_agent.tools import generate_healing_plan
 from reflection_agent.tools import check_execution_result, evaluate_and_publish

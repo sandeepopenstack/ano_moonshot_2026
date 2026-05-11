@@ -1,6 +1,5 @@
-import sys, os, asyncio, json, logging
+import os, sys, asyncio, json, logging
 from datetime import datetime
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -11,15 +10,15 @@ from google.genai.types import Content, Part
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 
-from shared.events import (
+from ran_healing_shared.events import (
     make_failure_notification_event, make_rca_confirmed_event,
     make_execution_completed_event, EVENT_BUS_KEY, NETWORK_STATUS_KEY,
     latest_key, publish_event, EVT_REFLEX_TRIAGE_READY, EVT_ENGINEER_READY,
     EVT_EXECUTION_COMPLETED,
 )
-from failure_injection_ms import build_trigger_event
-from providers.detective_provider import generate_detective_output
-from providers.execution_provider import generate_execution_output
+from ran_healing_shared.failure_injection_ms import build_trigger_event
+from ran_healing_shared.providers.detective_provider import generate_detective_output
+from ran_healing_shared.providers.execution_provider import generate_execution_output
 from reflex_agent.agent import root_agent as reflex_agent
 from engineer_agent.agent import root_agent as engineer_agent
 from reflection_agent.agent import root_agent as reflection_agent
