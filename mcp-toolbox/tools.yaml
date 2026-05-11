@@ -1,0 +1,69 @@
+tools:
+  query_entity_domains:
+    description: "Query entity domains and network segments for a list of EIDs"
+    inputSchema:
+      type: object
+      properties:
+        eids:
+          type: array
+          items:
+            type: string
+          description: "List of entity EIDs to query"
+      required:
+        - eids
+    spanner:
+      project: "poc-z-in2300756"
+      instance: "verizon-gnn"
+      database: "syndata"
+      sql: >
+        SELECT string_field_0 AS eid,
+               string_field_1 AS entity_type,
+               string_field_2 AS network_domain,
+               string_field_3 AS network_segment
+        FROM entity
+        WHERE string_field_0 IN UNNEST(@eids)
+
+  query_entity_connections:
+    description: "Query edge connections between entities"
+    inputSchema:
+      type: object
+      properties:
+        eids:
+          type: array
+          items:
+            type: string
+          description: "List of source entity EIDs"
+      required:
+        - eids
+    spanner:
+      project: "poc-z-in2300756"
+      instance: "verizon-gnn"
+      database: "syndata"
+      sql: >
+        SELECT eid AS source_eid,
+               to_eid AS target_eid,
+               edge_type,
+               network_domain
+        FROM edge_entitytoentity
+        WHERE eid IN UNNEST(@eids)
+
+  query_neighbor_cells:
+    description: "Query neighbor cell relationships"
+    inputSchema:
+      type: object
+      properties:
+        eids:
+          type: array
+          items:
+            type: string
+          description: "List of entity EIDs"
+      required:
+        - eids
+    spanner:
+      project: "poc-z-in2300756"
+      instance: "verizon-gnn"
+      database: "syndata"
+      sql: >
+        SELECT eid AS source_eid, to_eid AS neighbor_eid
+        FROM edge_entitytoneighbor
+        WHERE eid IN UNNEST(@eids)
