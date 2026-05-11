@@ -1,0 +1,3 @@
+google-adk[vertexai]>=1.0.0
+google-cloud-bigquery>=3.11.0
+requests>=2.31.0
