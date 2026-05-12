@@ -1,0 +1,66 @@
+{
+  "name": "ReflectionAgent",
+  "description": "Reads executor.executed event from Executor Agent. Validates execution outcome by checking network status against recovery targets. Publishes resolved if successful or re-triggers the pipeline if remediation failed. Enforces max retry limit of 30 loops.",
+  "url": "https://ran-reflection-test-761300295499.us-central1.run.app/a2a/reflection_agent",
+  "version": "1.0.0",
+  "capabilities": {
+    "streaming": false,
+    "push_notifications": false
+  },
+  "default_input_modes": [
+    "text/plain"
+  ],
+  "default_output_modes": [
+    "text/plain"
+  ],
+  "skills": [
+    {
+      "id": "outcome-validation",
+      "name": "Execution Outcome Validation",
+      "description": "Reads executor.executed event and validates whether remediation action achieved its intended outcome by comparing network status against recovery targets. Determines resolution success or pipeline re-trigger.",
+      "tags": [
+        "validation",
+        "outcome",
+        "remediation-verification"
+      ],
+      "examples": [
+        "Validate antenna tilt adjustment outcome",
+        "Validate HSS session clear outcome",
+        "Determine RESOLVED or RETRIGGER decision"
+      ]
+    },
+    {
+      "id": "pipeline-loop-control",
+      "name": "Pipeline Loop Control",
+      "description": "Manages the max retry loop (default 30 iterations). Publishes resolved event on success, or re-publishes reflex.triage.ready with retry_count incremented. Prevents infinite pipeline looping.",
+      "tags": [
+        "retry",
+        "loop-control",
+        "pipeline"
+      ],
+      "examples": [
+        "Publish resolved event on successful remediation",
+        "Re-trigger pipeline with incremented retry_count",
+        "Publish failure event when max retries exceeded"
+      ]
+    },
+    {
+      "id": "recovery-target-matching",
+      "name": "Recovery Target Matching",
+      "description": "Compares post-remediation network KPIs against recovery targets (KPI normal values from PERFORMANCE.csv). Uses TMF921 recovery target expressions to verify successful remediation.",
+      "tags": [
+        "kpi",
+        "recovery-targets",
+        "tmf921"
+      ],
+      "examples": [
+        "Check KPI values against recovery targets",
+        "Verify network_status resolved vs degraded"
+      ]
+    }
+  ],
+  "provider": {
+    "organization": "Verizon",
+    "url": "https://verizon.com"
+  }
+}

@@ -1,0 +1,66 @@
+{
+  "name": "ReflexAgent",
+  "description": "Receives anomaly trigger. Makes tools call to GNN Inference Engine. Queries Spanner via MCP for entity domain metadata and impact radius. Performs domain triage. Publishes reflex.triage.ready to Detective Agent.",
+  "url": "https://ran-reflex-test-761300295499.us-central1.run.app/a2a/reflex_agent",
+  "version": "1.0.0",
+  "capabilities": {
+    "streaming": false,
+    "push_notifications": false
+  },
+  "default_input_modes": [
+    "text/plain"
+  ],
+  "default_output_modes": [
+    "text/plain"
+  ],
+  "skills": [
+    {
+      "id": "gnn-inference",
+      "name": "GNN Inference Engine Integration",
+      "description": "Calls GNN Inference Engine with anomaly payload, retrieves anomalous subgraph, per-node anomaly scores, composite impact score, and ranked remediation branches.",
+      "tags": [
+        "gnn",
+        "anomaly-detection",
+        "graph-inference"
+      ],
+      "examples": [
+        "Receive FailureInjectionCreateEvent from FailureInjectionMS",
+        "POST /analyze-anomaly with event payload",
+        "Receive anomalous subgraph with ranked branches"
+      ]
+    },
+    {
+      "id": "spanner-triage",
+      "name": "Spanner Domain Triage",
+      "description": "Queries Spanner entity tables via MCP Toolbox or direct Spanner API to determine network domain (RAN/CORE/TRANSPORT/CROSS_DOMAIN), impact radius, and entity metadata for affected nodes. Maps GNN ranked branches to domain priority.",
+      "tags": [
+        "spanner",
+        "mcp",
+        "domain-triage"
+      ],
+      "examples": [
+        "Query query_entity_domains for affected EIDs",
+        "Query query_entity_connections for impact radius",
+        "Query query_neighbor_cells for blast radius"
+      ]
+    },
+    {
+      "id": "event-publishing",
+      "name": "Reflex Triage Event Publishing",
+      "description": "Publishes reflex.triage.ready event with 6 fields (entity_ids, anomalous_subgraph, ranked_list, domain_triage, priority_flag, priority) for Detective Agent consumption.",
+      "tags": [
+        "event-bus",
+        "publish",
+        "triage"
+      ],
+      "examples": [
+        "Publish reflex.triage.ready with priority=CRITICAL",
+        "Publish reflex.triage.ready with domain_triage=RAN"
+      ]
+    }
+  ],
+  "provider": {
+    "organization": "Verizon",
+    "url": "https://verizon.com"
+  }
+}

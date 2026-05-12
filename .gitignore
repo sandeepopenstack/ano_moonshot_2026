@@ -6,3 +6,5 @@ excalidraw.log
 logs/
 dist/
 .adk/
+*.whl
+Dockerfile

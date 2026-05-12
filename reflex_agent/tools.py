@@ -501,7 +501,8 @@ def perform_triage(tool_context: ToolContext) -> str:
 
     toolbox_up = _is_toolbox_running()
     print("\n[ReflexAgent \u2014 Step 5] MCP/tools call to Spanner DB")
-    print(f"  MCP Toolbox : {'RUNNING at ' + _TOOLBOX_URL if toolbox_up else 'NOT RUNNING \u2014 using fallback'}")
+    mcp_status = f"RUNNING at {_TOOLBOX_URL}" if toolbox_up else "NOT RUNNING \u2014 using fallback"
+    print(f"  MCP Toolbox : {mcp_status}")
     print(f"  Spanner     : {_SPANNER_INSTANCE}/{_SPANNER_DATABASE}")
     print(f"  Query EIDs  : {query_eids}")
     print(f"  Source      : {'2b payload (real synth EIDs)' if all_entities_2b else 'GNN node IDs (fallback)'}")

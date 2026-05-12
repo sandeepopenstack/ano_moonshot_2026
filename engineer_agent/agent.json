@@ -1,0 +1,66 @@
+{
+  "name": "EngineerAgent",
+  "description": "Reads confirmed RCA from Detective Agent. Scores healing branches using utility formula: impact * criticality * (1-risk) * reversibility. Builds TMF921 remediation intent. Publishes engineer.ready for Executor Agent.",
+  "url": "https://ran-engineer-test-761300295499.us-central1.run.app/a2a/engineer_agent",
+  "version": "1.0.0",
+  "capabilities": {
+    "streaming": false,
+    "push_notifications": false
+  },
+  "default_input_modes": [
+    "text/plain"
+  ],
+  "default_output_modes": [
+    "text/plain"
+  ],
+  "skills": [
+    {
+      "id": "utility-scoring",
+      "name": "Healing Branch Utility Scoring",
+      "description": "Scores each healing branch using utility formula: Utility = impact * criticality * (1 - risk) * reversibility. Ranks branches by utility score (highest first). Fetches business metadata per entity from BigQuery or structural fallback.",
+      "tags": [
+        "utility-scoring",
+        "remediation",
+        "branch-ranking"
+      ],
+      "examples": [
+        "Compute utility for antenna tilt rollback branch",
+        "Compute utility for HSS session clear branch",
+        "Rank branches by utility score descending"
+      ]
+    },
+    {
+      "id": "tmf921-intent",
+      "name": "TMF921 Remediation Intent Builder",
+      "description": "Builds TMF921-compliant remediation intent with recovery target expressions, action commands (ANTENNA_TILT_ADJUST, HSS_SESSION_CLEAR, TRANSPORT_FAILOVER), and parameter bounds from remediation configuration.",
+      "tags": [
+        "tmf921",
+        "remediation-intent",
+        "tmf915"
+      ],
+      "examples": [
+        "Build antenna tilt rollback command with target_degrees",
+        "Build HSS session clear command with max_clear",
+        "Build transport failover command with backup_path"
+      ]
+    },
+    {
+      "id": "rca-parsing",
+      "name": "Detective RCA Parsing",
+      "description": "Parses detective.rca.confirmed event from Detective Agent. Extracts root_cause, domain, affected_entities, causal_parameters, recovery_targets, risk_score, reversibility_score, and KPI delta percentage.",
+      "tags": [
+        "rca",
+        "detective",
+        "root-cause-analysis"
+      ],
+      "examples": [
+        "Parse root_cause from detective.rca.confirmed",
+        "Extract kpi_delta_pct for utility computation"
+      ]
+    }
+  ],
+  "provider": {
+    "organization": "Verizon",
+    "url": "https://verizon.com"
+  }
+}
