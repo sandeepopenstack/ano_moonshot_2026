@@ -1,19 +1,21 @@
 # ANO Moonshot 2026 — RAN Self-Healing Agentic Pipeline
 
-Multi-agent **RAN Self-Healing** proof-of-concept built on [Google ADK](https://google.github.io/adk/). Three independent LLM agents (Reflex, Engineer, Reflection) chained by an orchestrator to detect, diagnose, and heal RAN/Core network faults — no human in the loop.
+Multi-agent **RAN Self-Healing** proof-of-concept built on [Google ADK](https://google.github.io/adk/). Three independent LLM agents (Reflex, Engineer, Reflection) communicate via **A2A protocol** (peer-to-peer JSON-RPC, no orchestrator) to detect, diagnose, and heal RAN/Core network faults — no human in the loop.
 
 ---
 
 ## Pipeline Flow
 
 ```
-Failure Injection → ReflexAgent (LLM: triage via GNN/Spanner)
-                 → DetectiveAgent (mock: root cause analysis)
-                 → EngineerAgent (LLM: generate healing plan)
-                 → ExecutorAgent (mock: execute remediation)
-                 → ReflectionAgent (LLM: verify resolution)
-                 → RESOLVED or RETRIGGER (max 30 loops)
+FailureInjection → ReflexAgent (LLM: triage via GNN/Spanner)
+                → DetectiveAgent (mock: root cause analysis)
+                → EngineerAgent (LLM: generate healing plan)
+                → ExecutorAgent (mock: execute remediation)
+                → ReflectionAgent (LLM: verify resolution)
+                → RESOLVED or RETRIGGER (max 30 loops)
 ```
+
+Agents communicate via **A2A JSON-RPC** over HTTP. Each agent is deployed as a standalone Cloud Run service exposing A2A endpoints.
 
 ### Supported Use Cases
 
@@ -39,24 +41,35 @@ Failure Injection → ReflexAgent (LLM: triage via GNN/Spanner)
 ├── reflex_agent/                # Agent 1: triage & classification
 │   ├── agent.py                 # ADK agent definition (LlmAgent)
 │   ├── tools.py                 # GNN query → triage → publish
-│   ├── requirements.txt         # + ran_healing_shared .whl
-│   └── Dockerfile               # Cloud Run container
+│   ├── agent.json               # A2A Agent Card (v0.3 Pydantic)
+│   ├── __init__.py              # Package marker
+│   ├── requirements.txt         # + ran_healing_shared .whl (abs path)
+│   └── ran_healing_shared-0.1.0-py3-none-any.whl  # Pre-built shared wheel
 │
 ├── engineer_agent/              # Agent 2: healing plan generation
 │   ├── agent.py
 │   ├── tools.py
+│   ├── agent.json
+│   ├── __init__.py
 │   ├── requirements.txt
-│   └── Dockerfile
+│   └── ran_healing_shared-0.1.0-py3-none-any.whl
 │
 ├── reflection_agent/            # Agent 3: verification & compliance
 │   ├── agent.py
 │   ├── tools.py
+│   ├── agent.json
+│   ├── __init__.py
 │   ├── requirements.txt
-│   └── Dockerfile
+│   └── ran_healing_shared-0.1.0-py3-none-any.whl
 │
-├── orchestrator.py              # Pipeline orchestrator (ADK REST API)
-├── test.py                      # No-LLM pipeline test (instant)
-├── test_live.py                 # Live LLM pipeline test
+├── tests/                       # Test scripts
+│   ├── test.py                  # No-LLM pipeline test (instant)
+│   ├── test_live.py             # Live LLM pipeline test
+│   ├── test_deployed_agents.py  # Health check all 3 deployed services
+│   ├── test_invoke_all.py       # Invoke all 3 via ADK API
+│   └── test_reflex_invoke.py    # Invoke reflex agent only
+│
+├── orchestrator.py              # (Deprecated) Old centralized orchestrator
 ├── pyproject.toml               # Build config for ran_healing_shared
 ├── .env                         # GCP & model configuration
 ├── AGENTS.md                    # OpenCode agent instructions
@@ -71,45 +84,63 @@ Failure Injection → ReflexAgent (LLM: triage via GNN/Spanner)
 
 ### Prerequisites
 
-- Python 3.12+
+- Python 3.11+
 - Google ADK CLI: `pip install google-adk[vertexai]`
 - GCP project with Vertex AI enabled (or Gemini API key)
 - (Optional) Spanner instance for real GNN queries
 
-### 1. Install & Run Locally
+### 1. Install & Run Locally (no-LLM test)
 
 ```bash
 # Install shared package + dependencies
 pip install -e ./ran_healing_shared/
 
 # No-LLM test (instant, pure Python — no API calls)
-python test.py
-USE_CASE_ID=uc2 python test.py
+python tests/test.py
+USE_CASE_ID=uc2 python tests/test.py
 
 # Live LLM test (requires Vertex AI or GEMINI_API_KEY)
-python test_live.py
-USE_CASE_ID=uc2 python test_live.py
+python tests/test_live.py
+USE_CASE_ID=uc2 python tests/test_live.py
 ```
 
-### 2. Start the ADK API Server (for REST pipeline)
+### 2. Build Shared Wheel (for deployment)
 
 ```bash
-# Start the server — serves all agents registered in subdirectories
-adk api_server --port=8000 /path/to/repo/root
-
-# Or start via tmux (already running on port 8000):
-# tmux new-session -d -s adk-server adk api_server --port=8000 /path/to/repo/root
+pip install build
+python -m build
+cp dist/ran_healing_shared-0.1.0-py3-none-any.whl reflex_agent/
+cp dist/ran_healing_shared-0.1.0-py3-none-any.whl engineer_agent/
+cp dist/ran_healing_shared-0.1.0-py3-none-any.whl reflection_agent/
 ```
 
-### 3. Run the Orchestrator (REST pipeline)
+### 3. Deploy to Cloud Run
+
+Each agent deploys independently with A2A enabled. Critical requirements:
+- `agent.json` must exist with v0.3 Pydantic AgentCard schema (includes `url` field)
+- `requirements.txt` must pin `a2a-sdk>=0.3.4,<0.4`
+- `.whl` path in requirements must be absolute (`/app/agents/{app_name}/...`)
+- `--build-service-account` required via `--` passthrough
 
 ```bash
-# Uses ADK_BASE_URL=http://localhost:8000 by default
-python orchestrator.py
-USE_CASE_ID=uc2 python orchestrator.py
+adk deploy cloud_run \
+  --project=$PROJECT --region=us-central1 \
+  --app_name=engineer_agent \
+  --service_name=ran-engineer-test \
+  --a2a \
+  --update-env-vars=GOOGLE_GENAI_USE_VERTEXAI=true,AGENT_MODEL=gemini-2.5-flash \
+  -- \
+  --build-service-account=projects/$PROJECT/serviceAccounts/techm-dev@$PROJECT.iam.gserviceaccount.com \
+  engineer_agent/
 ```
 
-### 4. (Optional) Start MCP Toolbox for Spanner
+### 4. Verify
+
+```bash
+python tests/test_deployed_agents.py
+```
+
+### 5. (Optional) Start MCP Toolbox for Spanner
 
 ```bash
 ./start_mcp_toolbox.sh   # Terminal 1: starts MCP Toolbox on port 5000
@@ -117,68 +148,58 @@ USE_CASE_ID=uc2 python orchestrator.py
 
 ---
 
-## API Architecture
+## A2A Architecture
 
 ```
-                  ┌──────────────────────────────┐
-                  │      orchestrator.py          │
-                  │  (deterministic event router) │
-                  └──────┬───────┬───────┬───────┘
-                         │       │       │
-              ┌──────────┘       │       └──────────┐
-              ▼                  ▼                  ▼
-     ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-     │ ReflexAgent  │  │EngineerAgent │  │Reflection    │
-     │ (LLM triage  │  │(LLM healing  │  │Agent (LLM    │
-     │  via GNN)    │  │ plan gen)    │  │ verification)│
-     └──────────────┘  └──────────────┘  └──────────────┘
-              │                  │                  │
-              ▼                  ▼                  ▼
-     ┌─────────────────────────────────────────────────┐
-     │          ADK REST API (POST /run)                │
-     │  Create Session → Seed State → Run → Get State  │
-     └─────────────────────────────────────────────────┘
+                   ┌──────────────┐
+                   │  A2A Protocol │
+                   │ (JSON-RPC)    │
+                   └──────┬───────┘
+                          │
+          ┌───────────────┼───────────────┐
+          │               │               │
+          ▼               ▼               ▼
+ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+ │ ReflexAgent  │ │EngineerAgent │ │Reflection    │
+ │ (LLM triage  │ │(LLM healing  │ │Agent (LLM    │
+ │  via GNN)    │ │ plan gen)    │ │ verification)│
+ └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
+        │                │                │
+        ▼                ▼                ▼
+ ┌─────────────────────────────────────────────────┐
+ │      Cloud Run (3 independent services)          │
+ │   A2A: POST /a2a/{app_name}                      │
+ │   ADK API: POST /run                             │
+ └─────────────────────────────────────────────────┘
 ```
 
-Each agent is a standalone ADK `LlmAgent` deployed independently. The orchestrator calls them via `POST /run` with session state propagation (no Pub/Sub).
+Each agent is a standalone Cloud Run service. Agents call each other via A2A JSON-RPC (`POST /a2a/{app_name}`) using these methods:
 
-### ADK API Endpoints Used
-
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/apps/{app}/users/{user}/sessions` | POST | Create session with initial state |
-| `/run` | POST | Invoke agent (`RunAgentRequest`) |
-| `/apps/{app}/users/{user}/sessions/{id}` | GET | Read updated session state |
+| Method | Purpose |
+|--------|---------|
+| `SendMessage` | Send a task/message to the agent |
+| `GetTask` | Get task status and artifacts |
+| `ListTasks` | List all tasks for a session |
+| `CancelTask` | Cancel a running task |
 
 ---
 
-## Deployment
+## Deployed Agents
 
-### Local Dev (single server)
+| Agent | Service Name | App Name | URL |
+|-------|-------------|----------|-----|
+| ReflexAgent | `ran-reflex-test` | `reflex_agent` | `https://ran-reflex-test-761300295499.us-central1.run.app` |
+| EngineerAgent | `ran-engineer-test` | `engineer_agent` | `https://ran-engineer-test-761300295499.us-central1.run.app` |
+| ReflectionAgent | `ran-reflection-test` | `reflection_agent` | `https://ran-reflection-test-761300295499.us-central1.run.app` |
 
-All agents register on one ADK server; the orchestrator points to `ADK_BASE_URL=http://localhost:8000`.
+All deployed in `us-central1`, project `poc-z-in2300756`. Authentication required (identity tokens).
 
-### Cloud Run (3 independent services)
+### A2A Agent Card Endpoints
 
-```bash
-adk deploy cloud_run \
-  --project=$PROJECT --region=us-central1 \
-  --service_name=ran-reflex-agent --with_ui \
-  reflex_agent/ \
-  -- --build-service-account=$BUILD_SA --quiet
-
-# Then set env vars per service:
-gcloud run services update ran-reflex-agent \
-  --update-env-vars=GOOGLE_GENAI_USE_VERTEXAI=true,AGENT_MODEL=gemini-2.5-flash
 ```
-
-Orchestrator picks up Cloud Run URLs via env vars:
-
-```bash
-REFLEX_AGENT_URL=https://ran-reflex-agent-xxx.a.run.app \
-ENGINEER_AGENT_URL=https://ran-engineer-agent-xxx.a.run.app \
-REFLECTION_AGENT_URL=https://ran-reflection-agent-xxx.a.run.app \
-python orchestrator.py
+GET /a2a/reflex_agent/.well-known/agent-card.json
+GET /a2a/engineer_agent/.well-known/agent-card.json
+GET /a2a/reflection_agent/.well-known/agent-card.json
 ```
 
 ---
@@ -194,10 +215,8 @@ python orchestrator.py
 | `SPANNER_INSTANCE` | `verizon-gnn` | Spanner instance (ReflexAgent) |
 | `SPANNER_DATABASE` | `syndata` | Spanner database |
 | `TOOLBOX_URL` | `http://localhost:5000` | MCP Toolbox endpoint |
-| `MAX_PIPELINE_LOOPS` | `12` | Max retry iterations |
+| `MAX_PIPELINE_LOOPS` | `30` | Max retry iterations (ReflectionAgent) |
 | `USE_CASE_ID` | `uc1` | Fault scenario (`uc1` or `uc2`) |
-| `ADK_BASE_URL` | `http://localhost:8000` | ADK API server base URL |
-| `{NAME}_AGENT_URL` | — | Per-agent Cloud Run URL override |
 
 ---
 
@@ -205,10 +224,11 @@ python orchestrator.py
 
 | Command | What it tests | LLM calls? | Time |
 |---------|---------------|------------|------|
-| `python test.py` | All 6 pipeline steps (pure logic) | No | <1s |
-| `python test_live.py` | Full pipeline with Gemini | Yes | ~30s |
-| `USE_CASE_ID=uc2 python test.py` | Core fault scenario | No | <1s |
-| `python orchestrator.py` | REST API pipeline via ADK server | Yes | ~30s |
+| `python tests/test.py` | All 6 pipeline steps (pure logic) | No | <1s |
+| `python tests/test_live.py` | Full pipeline with Gemini | Yes | ~30s |
+| `USE_CASE_ID=uc2 python tests/test.py` | Core fault scenario | No | <1s |
+| `python tests/test_deployed_agents.py` | Health check all 3 Cloud Run services | No | ~5s |
+| `python tests/test_invoke_all.py` | Invoke all 3 via ADK API | Yes | ~30s |
 
 Tests produce detailed logs in `logs/` with JSON summaries.
 
@@ -216,12 +236,14 @@ Tests produce detailed logs in `logs/` with JSON summaries.
 
 ## Architecture Rules
 
-- **Event bus = session state** — `state["event_bus"]` list with `latest_{event_type}` keys. No Pub/Sub.
-- **`events.py`** is the lowest-level module — must NEVER import from agents or orchestrator.
-- **Orchestrator** routes events deterministically (if/elif on event type). Sub-agents use LLM; mocks call tools directly.
-- **ReflectionAgent** (v6+) calls tools directly (no LLM loop) to avoid timeout hangs.
+- **A2A communication**: Agents communicate via JSON-RPC (`POST /a2a/{app_name}`). No orchestrator, no Pub/Sub.
+- **Event bus = session state** — `state["event_bus"]` list with `latest_{event_type}` keys.
+- **`events.py`** is the lowest-level module — must NEVER import from agents.
+- **ReflectionAgent calls tools directly** (no LLM loop) to avoid timeout hangs.
 - **Mocks → Production**: swap `providers/*_provider.py` with real API clients. No agent logic changes.
 - **Import isolation**: `ran_healing_shared` is a pip-installable package. Agents import from it — no `sys.path.insert` needed.
+- **Agent `agent.json`**: uses v0.3 Pydantic AgentCard schema with REQUIRED `url` field. Without this, A2A endpoints return 404.
+- **`a2a-sdk` pin**: must be `>=0.3.4,<0.4`. v1.0.x lacks `a2a.server.apps` required by ADK 1.33.0.
 
 ---
 
