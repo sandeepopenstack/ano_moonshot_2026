@@ -25,6 +25,7 @@ _GCP_PROJECT      = os.environ.get("GOOGLE_CLOUD_PROJECT", "poc-z-in2300756")
 _SPANNER_INSTANCE = os.environ.get("SPANNER_INSTANCE", "verizon-gnn")
 _SPANNER_DATABASE = os.environ.get("SPANNER_DATABASE", "syndata")
 _TOOLBOX_URL = os.environ.get("TOOLBOX_URL", "http://localhost:5000").rstrip("/")
+_DETECTIVE_AGENT_URL = os.environ.get("DETECTIVE_AGENT_URL", "").rstrip("/")
 
 
 def _is_toolbox_running() -> bool:
@@ -733,6 +734,18 @@ def publish_triage(tool_context: ToolContext) -> str:
               f"impact={r['impact_score']} | criticality={r['criticality_label']}")
     print(f"\n  Next Step: Detective Agent (Ericsson) via A2A API")
     print("=" * 65)
+
+    if _DETECTIVE_AGENT_URL:
+        try:
+            requests.post(
+                f"{_DETECTIVE_AGENT_URL}/investigation-request",
+                json=detective_payload, timeout=30,
+            )
+            logging.info(f"[ReflexAgent] POST /investigation-request -> {_DETECTIVE_AGENT_URL}")
+        except Exception as e:
+            logging.warning(f"[ReflexAgent] POST /investigation-request failed: {e}")
+    else:
+        logging.info("[ReflexAgent] DETECTIVE_AGENT_URL not set — skipping outbound POST")
 
     return (
         f"PUBLISHED: reflex.triage.ready | "

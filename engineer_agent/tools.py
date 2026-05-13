@@ -12,6 +12,8 @@ from ran_healing_shared.events import (
     make_engineer_event,
     publish_event,
 )
+_EXECUTOR_AGENT_URL = os.environ.get("EXECUTOR_AGENT_URL", "").rstrip("/")
+
 from ran_healing_shared.remediation_config import (
     get_healing_actions,
     get_tilt_correction,
@@ -848,6 +850,19 @@ def generate_healing_plan(tool_context: ToolContext) -> dict:
     print("\n  RESPONSE PAYLOAD")
     print(json.dumps(engineer_response, indent=4, ensure_ascii=False))
     print("=" * 65)
+
+    if _EXECUTOR_AGENT_URL:
+        try:
+            import requests as _requests
+            _requests.post(
+                f"{_EXECUTOR_AGENT_URL}/execute-healing-plan",
+                json=executor_payload, timeout=30,
+            )
+            logging.info(f"[EngineerAgent] POST /execute-healing-plan -> {_EXECUTOR_AGENT_URL}")
+        except Exception as e:
+            logging.warning(f"[EngineerAgent] POST /execute-healing-plan failed: {e}")
+    else:
+        logging.info("[EngineerAgent] EXECUTOR_AGENT_URL not set — skipping outbound POST")
 
     return {
         "status":            "EVENT_PUBLISHED",
