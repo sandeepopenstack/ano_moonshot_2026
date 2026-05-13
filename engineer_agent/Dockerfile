@@ -9,4 +9,4 @@ ENV AGENT_MODEL=gemini-2.5-flash
 ENV BIZ_METADATA_SOURCE=mock
 EXPOSE 8000
 
-CMD ["adk", "api_server", "--port=8000", "/app"]
+CMD ["uvicorn", "engineer_agent.server:app", "--host", "0.0.0.0", "--port", "8000"]

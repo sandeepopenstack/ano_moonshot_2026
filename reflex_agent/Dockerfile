@@ -8,4 +8,4 @@ WORKDIR /app
 ENV AGENT_MODEL=gemini-2.5-flash
 EXPOSE 8000
 
-CMD ["adk", "api_server", "--port=8000", "/app"]
+CMD ["uvicorn", "reflex_agent.server:app", "--host", "0.0.0.0", "--port", "8000"]
