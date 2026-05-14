@@ -15,14 +15,14 @@ logging.basicConfig(level=logging.INFO)
 from datetime import datetime, timezone
 from google.adk.tools import ToolContext
 
-from app.events import (
+from ran_healing_shared.events import (
     EVT_DETECTIVE_RCA_CONFIRMED,
     NETWORK_STATUS_KEY,
     consume_latest,
     make_engineer_event,
     publish_event,
 )
-from app.config.remediation_config import UTILITY_SCORING
+from ran_healing_shared.remediation_config import UTILITY_SCORING
 
 EXECUTOR_AGENT_URL = os.environ.get("EXECUTOR_AGENT_URL")
 

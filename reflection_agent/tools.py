@@ -34,7 +34,7 @@ logging.basicConfig(level=logging.INFO)
 from datetime import datetime, timezone
 from google.adk.tools import ToolContext
 
-from app.events import (
+from ran_healing_shared.events import (
     EVT_EXECUTION_COMPLETED,
     EVT_FAILURE_NOTIFICATION,
     NETWORK_STATUS_KEY,
@@ -44,7 +44,7 @@ from app.events import (
     make_reflection_result_event,
     make_failure_notification_event,
 )
-from app.config.remediation_config import (
+from ran_healing_shared.remediation_config import (
     BASELINE_Z_SCORE,
     REFLECTION_CONFIG,
 )
