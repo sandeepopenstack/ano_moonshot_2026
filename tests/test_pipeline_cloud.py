@@ -5,9 +5,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from ran_healing_shared.providers.detective_provider import generate_detective_output
 from ran_healing_shared.providers.execution_provider import generate_execution_output
 from ran_healing_shared.events import (
+    EVT_FAILURE_NOTIFICATION,
+    EVT_DETECTIVE_RCA_CONFIRMED,
+    EVT_EXECUTION_COMPLETED,
+    EVENT_BUS_KEY, NETWORK_STATUS_KEY,
+    latest_key,
+    make_failure_notification_event,
     make_rca_confirmed_event,
     make_execution_completed_event,
 )
+from ran_healing_shared.failure_injection_ms import build_trigger_event
 
 SERVICES = {
     "reflex":     {"url": "https://ran-reflex-test-761300295499.us-central1.run.app",     "app": "reflex_agent"},
@@ -16,10 +23,14 @@ SERVICES = {
 }
 
 def get_token():
-    return subprocess.run([
-        "gcloud", "auth", "print-identity-token",
-        "--account=techm-dev@poc-z-in2300756.iam.gserviceaccount.com",
-    ], capture_output=True, text=True, timeout=15).stdout.strip()
+    tok = os.environ.get("IDENTITY_TOKEN")
+    if tok:
+        return tok
+    cmd = ["gcloud", "auth", "print-identity-token"]
+    acct = os.environ.get("GCLOUD_ACCOUNT")
+    if acct:
+        cmd.append(f"--account={acct}")
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout.strip()
 
 def create_session(url, app, state):
     token = get_token()
@@ -69,8 +80,14 @@ print("=" * 65)
 
 # ────────────────────────── STEP 1: ReflexAgent ──────────────────────────
 print("\n>>> STEP 1: ReflexAgent (LLM — real)")
-sid = create_session(SERVICES["reflex"]["url"], SERVICES["reflex"]["app"],
-                     {"network_status": "ANOMALY_DETECTED"})
+trigger = build_trigger_event(use_case_id=os.environ.get("USE_CASE_ID", "uc1"))
+failure_event = make_failure_notification_event(trigger)
+reflex_state = {
+    NETWORK_STATUS_KEY: "ANOMALY_DETECTED",
+    EVENT_BUS_KEY: [failure_event],
+    latest_key(EVT_FAILURE_NOTIFICATION): failure_event,
+}
+sid = create_session(SERVICES["reflex"]["url"], SERVICES["reflex"]["app"], reflex_state)
 events = run_agent(SERVICES["reflex"]["url"], SERVICES["reflex"]["app"], sid)
 calls = extract_tool_calls(events)
 print(f"  Session: {sid}")
@@ -80,30 +97,22 @@ assert "perform_triage" in calls, "Reflex: perform_triage not called"
 assert "publish_triage" in calls, "Reflex: publish_triage not called"
 print("  ✅ ReflexAgent PASSED")
 
-# Parse reflex output to extract payload for Detective mock
-reflex_text = extract_final_text(events)
-reflex_payload = {}
-for line in reflex_text.split("\n"):
-    if '"publish_triage_response"' in line:
-        try:
-            import re
-            m = re.search(r'\{.*\}', line)
-            if m:
-                resp = json.loads(m.group())
-                rpr = resp.get("publish_triage_response", {})
-                result = rpr.get("result", "")
-                reflex_payload = {
-                    "entity_ids": [],
-                    "domain_triage": "RAN",
-                    "priority": "CRITICAL",
-                    "impact_score": 0.94,
-                    "criticality_score": 1.0,
-                    "criticality_label": "CRITICAL",
-                    "ranked_list": [],
-                    "eventId": "reflex-ev-1",
-                }
-        except Exception:
-            pass
+# Build reflex_payload from the trigger event (used by Detective mock in Step 2)
+reflex_payload = {
+    "entity_ids": trigger.get("affected_enodebs", []) or trigger.get("affected_core_elements", []),
+    "domain_triage": trigger.get("domain", "RAN"),
+    "priority": "CRITICAL",
+    "impact_score": 0.94,
+    "criticality_score": 1.0,
+    "criticality_label": "CRITICAL",
+    "ranked_list": [{"rank": i+1, "node_id": eid} for i, eid in enumerate(
+        trigger.get("affected_enodebs", []) or trigger.get("affected_core_elements", [])
+    )],
+    "eventId": "reflex-ev-1",
+    "affected_neighbor_enodebs": trigger.get("affected_neighbor_enodebs", []),
+}
+print(f"  Reflex payload entity_ids: {reflex_payload.get('entity_ids')}")
+print(f"  Reflex payload domain_triage: {reflex_payload.get('domain_triage')}")
 
 # ────────────────────────── STEP 2: DetectiveAgent (mock, local) ─────────
 print("\n>>> STEP 2: DetectiveAgent (mock — local)")
@@ -119,8 +128,8 @@ print("  ✅ DetectiveAgent mock PASSED")
 # ────────────────────────── STEP 3: EngineerAgent (LLM — real) ───────────
 print("\n>>> STEP 3: EngineerAgent (LLM — real)")
 engineer_state = {
-    "latest_detective.rca.confirmed": rca_event,
-    "network_status": "HEALING",
+    latest_key(EVT_DETECTIVE_RCA_CONFIRMED): rca_event,
+    NETWORK_STATUS_KEY: "HEALING",
 }
 sid_e = create_session(SERVICES["engineer"]["url"], SERVICES["engineer"]["app"], engineer_state)
 events_e = run_agent(SERVICES["engineer"]["url"], SERVICES["engineer"]["app"], sid_e)
@@ -130,20 +139,25 @@ print(f"  Tools: {calls_e}")
 assert "generate_healing_plan" in calls_e, "Engineer: generate_healing_plan not called"
 print("  ✅ EngineerAgent PASSED")
 
-# Parse engineer output
-engineer_text = extract_final_text(events_e)
-engineer_payload = {}
-for line in engineer_text.split("\n"):
-    if '"generate_healing_plan_response"' in line:
-        try:
-            m = re.search(r'\{.*\}', line)
-            if m:
-                resp = json.loads(m.group())
-                engineer_payload = resp.get("generate_healing_plan_response", {})
-        except Exception:
-            pass
+# Extract engineer_payload from structured functionResponse
+engineer_payload = None
+for e in events_e:
+    for p in (e.get("content") or {}).get("parts") or []:
+        fr = p.get("functionResponse")
+        if fr and "generate_healing_plan" in fr.get("name", ""):
+            resp = fr.get("response", {})
+            # The response may contain the payload directly or nested
+            inner = resp.get("generate_healing_plan_response", resp.get("result", resp))
+            if isinstance(inner, dict) and inner.get("status"):
+                engineer_payload = inner
+                break
+            if isinstance(inner, dict):
+                engineer_payload = inner
+                break
+    if engineer_payload:
+        break
 
-# If text parsing fails, reconstruct from event sequence
+# If structured extraction failed, reconstruct from event sequence
 if not engineer_payload:
     engineer_payload = {
         "root_cause": rca_output.get("root_cause", "antenna_tilt_misconfiguration"),

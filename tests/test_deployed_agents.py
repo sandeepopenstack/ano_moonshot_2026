@@ -22,14 +22,17 @@ _TOKEN = None
 
 def get_token():
     global _TOKEN
-    if not _TOKEN:
-        _TOKEN = subprocess.run(
-            [
-                "gcloud", "auth", "print-identity-token",
-                "--account=techm-dev@poc-z-in2300756.iam.gserviceaccount.com",
-            ],
-            capture_output=True, text=True, timeout=15,
-        ).stdout.strip()
+    if _TOKEN:
+        return _TOKEN
+    tok = os.environ.get("IDENTITY_TOKEN")
+    if tok:
+        _TOKEN = tok
+        return _TOKEN
+    cmd = ["gcloud", "auth", "print-identity-token"]
+    acct = os.environ.get("GCLOUD_ACCOUNT")
+    if acct:
+        cmd.append(f"--account={acct}")
+    _TOKEN = subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout.strip()
     return _TOKEN
 
 
@@ -58,14 +61,14 @@ def main():
         print(f"\n  >>> {name.upper()} ({agent})")
         print(f"  URL: {base}")
 
-        r = requests.get(f"{base}/health", headers=h, timeout=15)
+        r = requests.get(f"{base}/health", headers=h, timeout=30)
         results.append(verdict(f"health \u2192 {r.status_code}", r.status_code == 200))
 
-        r = requests.get(f"{base}/list-apps", headers=h, timeout=15)
+        r = requests.get(f"{base}/list-apps", headers=h, timeout=30)
         apps_ok = r.status_code == 200 and agent in r.text
         results.append(verdict(f"list-apps \u2192 {r.status_code} (has {agent})", apps_ok))
 
-        r = requests.get(f"{base}/a2a/{agent}/.well-known/agent-card.json", headers=h, timeout=15)
+        r = requests.get(f"{base}/a2a/{agent}/.well-known/agent-card.json", headers=h, timeout=30)
         card_ok = False
         if r.status_code == 200:
             try:
@@ -75,7 +78,7 @@ def main():
                 pass
         results.append(verdict(f"a2a card \u2192 {r.status_code} (name+skills+capabilities)", card_ok))
 
-        r = requests.get(f"{base}/version", headers=h, timeout=15)
+        r = requests.get(f"{base}/version", headers=h, timeout=30)
         results.append(verdict(f"version \u2192 {r.status_code}", r.status_code == 200))
 
     print("\n" + "=" * 65)
