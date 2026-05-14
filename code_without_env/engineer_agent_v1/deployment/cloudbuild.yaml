@@ -1,0 +1,15 @@
+steps:
+    # Pull image already deployed so that we can use the layers as cache for next build
+  - name: 'gcr.io/cloud-builders/docker'
+    entrypoint: 'bash'
+    args: [ '-c', 'docker pull ${_IMAGE} || echo "no cache found"' ]
+    # Docker Build by using cache from already build image
+  - name: 'gcr.io/cloud-builders/docker'
+    args: [
+      'build',
+      '-t', '${_IMAGE}',
+      '--cache-from', '${_IMAGE}',
+      '.']
+      # Docker Push
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', '${_IMAGE}']

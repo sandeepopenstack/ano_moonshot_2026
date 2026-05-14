@@ -1,0 +1,180 @@
+# tools.yaml — MCP Toolbox for Databases v1.2.0
+# Spanner: poc-z-in2300756 / verizon-gnn / syndata
+#
+# Column mapping (auto-named, verified against graph_tables.py Stage 12):
+#
+# ENTITY.csv:        string_field_0=eid, string_field_1=entity_type,
+#                    string_field_2=network_domain, string_field_3=network_segment
+# edge_entitytoentity:    eid, to_eid, edge_type, network_domain, direction, event_time
+# edge_entitytoneighbor:  eid, to_eid, event_time
+# edge_geobintoentity:    entity_id, network_domain, h3_id, event_time
+# performance:           eid, network_domain, event_ts, kpi_values, is_degraded
+# aw_base_hex07_anom:    h3_07, time_bucket, anomaly_label
+
+sources:
+  spanner-syndata:
+    kind: spanner
+    project: poc-z-in2300756
+    instance: verizon-gnn
+    database: syndata
+
+tools:
+
+  # ── Tool 1: query_entity_domains ─────────────────────────────────────────────
+  # ReflexAgent Step 5 — domain triage
+  # Reads: entity table (ENTITY.csv)
+  query_entity_domains:
+    kind: spanner-sql
+    source: spanner-syndata
+    description: >
+      Query entity table for domain metadata of affected nodes.
+      Returns eid, entity_type, network_domain, network_segment.
+      Used by ReflexAgent perform_triage for domain triage.
+    parameters:
+      - name: eids
+        type: array
+        description: List of entity EIDs to query
+        items:
+          name: eid
+          type: string
+          description: A single entity EID string
+    statement: |
+      SELECT
+        string_field_0 AS eid,
+        string_field_1 AS entity_type,
+        string_field_2 AS network_domain,
+        string_field_3 AS network_segment
+      FROM entity
+      WHERE string_field_0 IN UNNEST(@eids)
+
+  # ── Tool 2: query_entity_connections ─────────────────────────────────────────
+  # ReflexAgent Step 5 — impact radius
+  # Reads: edge_entitytoentity (EDGE_EntityToEntity.csv)
+  query_entity_connections:
+    kind: spanner-sql
+    source: spanner-syndata
+    description: >
+      Fetch connected nodes from edge_entitytoentity for impact radius.
+      Returns source_eid, target_eid, edge_type, network_domain.
+      Used by ReflexAgent to determine anomaly propagation distance.
+    parameters:
+      - name: eids
+        type: array
+        description: List of entity EIDs to find connections for
+        items:
+          name: eid
+          type: string
+          description: A single entity EID string
+    statement: |
+      SELECT
+        eid        AS source_eid,
+        to_eid     AS target_eid,
+        edge_type,
+        network_domain
+      FROM edge_entitytoentity
+      WHERE eid IN UNNEST(@eids)
+
+  # ── Tool 3: query_neighbor_cells ─────────────────────────────────────────────
+  # ReflexAgent Step 5 — H3-adjacent blast radius
+  # Reads: edge_entitytoneighbor (EDGE_EntityToNeighbor.csv)
+  query_neighbor_cells:
+    kind: spanner-sql
+    source: spanner-syndata
+    description: >
+      Fetch H3-adjacent neighbor cells from edge_entitytoneighbor.
+      Returns source_eid and neighbor_eid.
+      Used by ReflexAgent for geographic blast radius analysis.
+    parameters:
+      - name: eids
+        type: array
+        description: List of entity EIDs to find neighbors for
+        items:
+          name: eid
+          type: string
+          description: A single entity EID string
+    statement: |
+      SELECT
+        eid    AS source_eid,
+        to_eid AS neighbor_eid
+      FROM edge_entitytoneighbor
+      WHERE eid IN UNNEST(@eids)
+
+  # ── Tool 4: query_entity_performance ─────────────────────────────────────────
+  # ReflectionAgent Gate 3 — post-healing KPI state
+  # Reads: performance table (PERFORMANCE.csv)
+  query_entity_performance:
+    kind: spanner-sql
+    source: spanner-syndata
+    description: >
+      Fetch latest recovery validation rows from performance table.
+      Returns eid, network_domain, event_ts, kpi_values, and is_degraded.
+      Used by ReflectionAgent Gate 3.
+    parameters:
+      - name: eids
+        type: array
+        description: List of entity EIDs to fetch performance KPIs for
+        items:
+          name: eid
+          type: string
+          description: A single entity EID string
+    statement: |
+      SELECT
+        eid,
+        network_domain,
+        event_ts,
+        kpi_values,
+        is_degraded
+      FROM performance
+      WHERE eid IN UNNEST(@eids)
+      ORDER BY event_ts DESC
+
+  # ── Tool 5: query_entity_hex_bins ───────────────────────────────────────────
+  # ReflectionAgent Gate 2 prep — resolve entity EIDs to H3 bins
+  # Reads: edge_geobintoentity (EDGE_GeobinToEntity.csv)
+  query_entity_hex_bins:
+    kind: spanner-sql
+    source: spanner-syndata
+    description: >
+      Resolve affected network entity EIDs to h3_07 hex bins for
+      ReflectionAgent anomaly-label validation.
+    parameters:
+      - name: eids
+        type: array
+        description: List of entity EIDs to resolve to hex bins
+        items:
+          name: eid
+          type: string
+          description: A single entity EID string
+    statement: |
+      SELECT DISTINCT
+        entity_id AS eid,
+        h3_id AS h3_07
+      FROM edge_geobintoentity
+      WHERE entity_id IN UNNEST(@eids)
+        AND h3_id IS NOT NULL
+
+  # ── Tool 6: query_hex_anomaly_labels ────────────────────────────────────────
+  # ReflectionAgent Gate 2 — anomaly label restored
+  # Reads: aw_base_hex07_anom
+  query_hex_anomaly_labels:
+    kind: spanner-sql
+    source: spanner-syndata
+    description: >
+      Fetch latest anomaly_label rows from aw_base_hex07_anom for affected
+      H3 hex bins. ReflectionAgent passes only when all labels are NORMAL.
+    parameters:
+      - name: bins
+        type: array
+        description: List of h3_07 hex bins to validate
+        items:
+          name: h3_07
+          type: string
+          description: A single H3 resolution-7 hex bin
+    statement: |
+      SELECT
+        h3_07,
+        anomaly_label,
+        time_bucket
+      FROM aw_base_hex07_anom
+      WHERE h3_07 IN UNNEST(@bins)
+      ORDER BY time_bucket DESC
