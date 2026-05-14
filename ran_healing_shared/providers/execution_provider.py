@@ -37,19 +37,16 @@ def generate_execution_output(engineer_payload: dict) -> dict:
     target_entities = _first_present(
         tmf921.get("target_entities"),
         engineer_payload.get("affected_entities"),
-        [],
-    )
+    ) or []
     affected_hex_bins = _first_present(
         engineer_payload.get("affected_hex_bins"),
         tmf921.get("affected_hex_bins"),
-        [],
-    )
+    ) or []
     ranked_branches = _first_present(
         tmf921.get("ranked_healing_branches"),
         engineer_payload.get("ranked_healing_plan"),
         engineer_payload.get("ranked_branches"),
-        [],
-    )
+    ) or []
     primary_branch = ranked_branches[0] if ranked_branches else {}
 
     root_cause = tmf921.get("root_cause", engineer_payload.get("root_cause", ""))
