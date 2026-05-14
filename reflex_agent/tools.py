@@ -27,15 +27,15 @@ import json
 from datetime import datetime, timezone
 from google.adk.tools import ToolContext
 
-from app.events import (
+from ran_healing_shared.events import (
     EVT_FAILURE_NOTIFICATION,
     EVT_REFLEX_TRIAGE_READY,
     NETWORK_STATUS_KEY,
     publish_event,
     latest_key,
 )
-from app.config.remediation_config import infer_domain
-from gnn_inference_provider import prompt_gnn_engine
+from ran_healing_shared.remediation_config import infer_domain
+from ran_healing_shared.gnn_inference_provider import prompt_gnn_engine
 logging.basicConfig(level=logging.INFO)
 
 _BRANCH_PRIORITY_LABEL = {0: "HIGH", 1: "MEDIUM", 2: "LOW"}
