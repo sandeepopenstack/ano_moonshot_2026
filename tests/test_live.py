@@ -125,7 +125,7 @@ async def main():
     USE_CASE_ID = os.environ.get("USE_CASE_ID", "uc1")
     trigger_payload = build_trigger_event(use_case_id=USE_CASE_ID)
 
-    separator(f"PIPELINE: {trigger_payload['useCaseId']} \u2014 {trigger_payload.get('label', '')}")
+    separator(f"PIPELINE: {trigger_payload['useCaseId']} - {trigger_payload.get('label', '')}")
     log.info(f"  Trigger    : {trigger_payload['trigger']}")
     log.info(f"  Domain     : {trigger_payload['domain']}")
     log.info(f"  Affected   : {trigger_payload['affected_enodebs'] + trigger_payload['affected_core_elements']}")
@@ -143,7 +143,7 @@ async def main():
         latest_key(failure_event["event_type"]): failure_event,
     }
 
-    separator("STEP 1: ReflexAgent (LLM \u2014 3 tools: call_gnn_engine \u2192 perform_triage \u2192 publish_triage)")
+    separator("STEP 1: ReflexAgent (LLM - 3 tools: call_gnn_engine -> perform_triage -> publish_triage)")
     try:
         state = await run_agent(reflex_agent, state, agent_name="ReflexAgent")
     except Exception as e:
@@ -165,7 +165,7 @@ async def main():
     publish_event(state, rca_event)
     log.info(f"  root_cause={rca_output.get('root_cause')} | domain={rca_output.get('domain')} | confidence={rca_output.get('confidence_score')}")
 
-    separator("STEP 3: EngineerAgent (LLM \u2014 1 tool: generate_healing_plan)")
+    separator("STEP 3: EngineerAgent (LLM - 1 tool: generate_healing_plan)")
     try:
         state = await run_agent(engineer_agent, state, agent_name="EngineerAgent")
     except Exception as e:
@@ -186,7 +186,7 @@ async def main():
     publish_event(state, exec_event)
     log.info(f"  success={exec_output.get('success')} | state={exec_output.get('state')} | activation={exec_output.get('activation_id')}")
 
-    separator("STEP 5: ReflectionAgent (LLM \u2014 2 tools: check_execution_result \u2192 evaluate_and_publish)")
+    separator("STEP 5: ReflectionAgent (LLM - 2 tools: check_execution_result -> evaluate_and_publish)")
     try:
         state = await run_agent(reflection_agent, state, agent_name="ReflectionAgent")
     except Exception as e:

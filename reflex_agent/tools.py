@@ -1,29 +1,7 @@
-"""
-app/agents/reflex_agent/tools.py
-==================================
-ReflexAgent — 3 tools in sequence.
-
-Slide steps implemented:
-  Step 4a: call_gnn_engine  → tools call to GNN Inference Engine
-  Step 4b: GNN returns subgraph, scores, impact_score, criticality, ranked list
-  Step 5:  perform_triage   → MCP/tools call to Spanner for entity domains + impact radius
-           publish_triage   → sends triage payload to Detective Agent via A2A API/event routing
-
-MCP priority chain (perform_triage):
-  1. MCP Toolbox  (toolbox binary at TOOLBOX_URL — real MCP/HTTP protocol)
-  2. Spanner direct (google-cloud-spanner SDK — no toolbox needed)
-  3. Structural mock (domain inferred from EID prefix — no Spanner needed)
-
-NO hardcoded entity EIDs anywhere in this file.
-EID resolution: GNN node IDs → Spanner entity table → real EIDs from synth data.
-The entity table was loaded from ENTITY.csv (graph_tables.py Stage 12).
-"""
-
 import os
 import uuid
 import logging
 import requests
-import json
 from datetime import datetime, timezone
 from google.adk.tools import ToolContext
 
@@ -34,9 +12,12 @@ from ran_healing_shared.events import (
     publish_event,
     latest_key,
 )
-from ran_healing_shared.remediation_config import infer_domain
+from ran_healing_shared.remediation_config import (
+    infer_domain,
+    get_priority_from_gnn,
+)
 from ran_healing_shared.gnn_inference_provider import prompt_gnn_engine
-logging.basicConfig(level=logging.INFO)
+
 
 _BRANCH_PRIORITY_LABEL = {0: "HIGH", 1: "MEDIUM", 2: "LOW"}
 
@@ -44,22 +25,9 @@ _GCP_PROJECT      = os.environ.get("GOOGLE_CLOUD_PROJECT", "poc-z-in2300756")
 _SPANNER_INSTANCE = os.environ.get("SPANNER_INSTANCE", "verizon-gnn")
 _SPANNER_DATABASE = os.environ.get("SPANNER_DATABASE", "syndata")
 _TOOLBOX_URL = os.environ.get("TOOLBOX_URL", "http://localhost:5000").rstrip("/")
-GNN_INFERENCE_URL = os.environ.get("GNN_INFERENCE_URL")
-DETECTIVE_AGENT_URL = os.environ.get("DETECTIVE_AGENT_URL")
 
-# ── MCP Toolbox health check ───────────────────────────────────────────────────
 
 def _is_toolbox_running() -> bool:
-    """
-    Check if MCP Toolbox for Databases server is running (v1.x+).
-
-    v1.x removed /api/tool REST endpoints.
-    Health check: POST /mcp with JSON-RPC 2.0 initialize request.
-    A 200 response means the toolbox is up and accepting MCP calls.
-
-    v0.x fallback: GET / still returns 200 on both versions.
-    """
-    # Primary: JSON-RPC initialize handshake (v1.x)
     try:
         resp = requests.post(
             f"{_TOOLBOX_URL}/mcp",
@@ -77,10 +45,7 @@ def _is_toolbox_running() -> bool:
             timeout=3,
         )
         if 200 <= resp.status_code < 300:
-            logging.info(
-                f"[MCP] Toolbox running at {_TOOLBOX_URL}/mcp "
-                f"(status {resp.status_code})"
-            )
+            logging.info(f"[MCP] Toolbox running at {_TOOLBOX_URL}/mcp (status {resp.status_code})")
             return True
     except requests.exceptions.ConnectionError:
         return False
@@ -90,22 +55,7 @@ def _is_toolbox_running() -> bool:
     return False
 
 
-# ── MCP Toolbox query helpers ──────────────────────────────────────────────────
-
 def _invoke_tool(tool_name: str, params: dict) -> list[dict]:
-    """
-    Call a single MCP Toolbox tool via JSON-RPC 2.0 over POST /mcp.
-
-    MCP Toolbox v1.x dropped /api/tool/{name}/invoke (HTTP 410 Gone).
-    All tool calls now use the standard MCP JSON-RPC endpoint:
-      POST /mcp
-      Body: {"jsonrpc":"2.0","id":1,"method":"tools/call",
-             "params":{"name":"tool_name","arguments":{...}}}
-
-    Response format (MCP spec):
-      {"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"[...]"}]}}
-      The text field contains a JSON-encoded list of row dicts.
-    """
     import uuid
     url = f"{_TOOLBOX_URL}/mcp"
     rpc_payload = {
@@ -125,19 +75,15 @@ def _invoke_tool(tool_name: str, params: dict) -> list[dict]:
             timeout=15,
         )
         if resp.status_code != 200:
-            logging.warning(
-                f"[MCP] {tool_name} returned HTTP {resp.status_code}: {resp.text[:200]}"
-            )
+            logging.warning(f"[MCP] {tool_name} returned HTTP {resp.status_code}: {resp.text[:200]}")
             return []
 
         body = resp.json()
 
-        # MCP JSON-RPC error block
         if "error" in body:
             logging.warning(f"[MCP] {tool_name} RPC error: {body['error']}")
             return []
 
-        # Extract result content — MCP spec: result.content[0].text = JSON string
         result  = body.get("result", {})
         content = result.get("content", [])
 
@@ -154,11 +100,11 @@ def _invoke_tool(tool_name: str, params: dict) -> list[dict]:
                 except _json.JSONDecodeError:
                     logging.warning(f"[MCP] {tool_name} non-JSON text block: {block['text'][:100]}")
 
-        logging.info(f"[MCP] {tool_name} → {len(rows)} rows")
+        logging.info(f"[MCP] {tool_name} -> {len(rows)} rows")
         return rows
 
     except requests.exceptions.ConnectionError:
-        logging.warning(f"[MCP] {tool_name}: connection refused — toolbox stopped?")
+        logging.warning(f"[MCP] {tool_name}: connection refused - toolbox stopped?")
         return []
     except requests.exceptions.Timeout:
         logging.warning(f"[MCP] {tool_name}: timeout after 15s")
@@ -169,23 +115,12 @@ def _invoke_tool(tool_name: str, params: dict) -> list[dict]:
 
 
 def _query_via_mcp_toolbox(eids: list[str]) -> dict:
-    """
-    Query Spanner via Google MCP Toolbox for Databases.
-    Calls 3 tools defined in tools.yaml (each tool call is independent — one
-    failing does not abort the others).
-
-    Tools called:
-      query_entity_domains     → entity table (domain metadata)
-      query_entity_connections → edge_entitytoentity (impact radius)
-      query_neighbor_cells     → edge_entitytoneighbor (geographic neighbors)
-    """
     entity_details  = {}
     connected_nodes = []
     neighbor_cells  = []
     domains         = set()
     eid_set         = set(eids)
 
-    # Tool 1: entity domain metadata
     rows1 = _invoke_tool("query_entity_domains", {"eids": eids})
     for row in rows1:
         eid = row.get("eid", "")
@@ -201,7 +136,6 @@ def _query_via_mcp_toolbox(eids: list[str]) -> dict:
         if dom and dom != "UNKNOWN":
             domains.add(dom)
 
-    # Tool 2: entity connections (impact radius)
     rows2 = _invoke_tool("query_entity_connections", {"eids": eids})
     for row in rows2:
         target = row.get("target_eid", "")
@@ -213,7 +147,6 @@ def _query_via_mcp_toolbox(eids: list[str]) -> dict:
                 "target_domain": row.get("network_domain", "UNKNOWN"),
             })
 
-    # Tool 3: neighbor cells
     rows3 = _invoke_tool("query_neighbor_cells", {"eids": eids})
     for row in rows3:
         src = row.get("source_eid", "")
@@ -233,13 +166,7 @@ def _query_via_mcp_toolbox(eids: list[str]) -> dict:
     }
 
 
-# ── Spanner direct fallback ────────────────────────────────────────────────────
-
 def _query_spanner_direct(eids: list[str]) -> dict:
-    """
-    Direct Spanner client fallback — same 3 queries as MCP toolbox.
-    Used when toolbox binary is not running.
-    """
     from google.cloud import spanner as spanner_lib
 
     client   = spanner_lib.Client(project=_GCP_PROJECT)
@@ -307,15 +234,7 @@ def _query_spanner_direct(eids: list[str]) -> dict:
     }
 
 
-# ── Structural mock fallback ───────────────────────────────────────────────────
-
 def _query_spanner_mock(eids: list[str]) -> dict:
-    """
-    Structural mock — NO hardcoded EIDs.
-    Derives domain from EID prefix — matches synth data naming convention
-    (topology.py: eNB-SYN-NNN, gNB-SYN-NNN, HSS-SYN-01, CSR-SYN-NNN, AGG-SYN-NN).
-    Used only when both MCP toolbox and Spanner direct are unavailable.
-    """
     def _classify(eid: str) -> tuple[str, str, str]:
         u = eid.upper()
         if u.startswith("ENB") or "ENODEB" in u or "RAN_CELL" in u:
@@ -363,111 +282,74 @@ def _query_spanner_mock(eids: list[str]) -> dict:
     }
 
 
-# ── Unified Spanner query entry point ─────────────────────────────────────────
-
 def _query_spanner_impact_radius(eids: list[str]) -> dict:
-    """
-    Priority: MCP Toolbox → Spanner direct → structural mock.
-    Logs clearly which path was taken so the user can diagnose MCP issues.
-    """
     if _is_toolbox_running():
         try:
             logging.info(f"[ReflexAgent] MCP Toolbox at {_TOOLBOX_URL}")
             result = _query_via_mcp_toolbox(eids)
-            logging.info(
-                f"[ReflexAgent] MCP OK: {len(result['entity_details'])} entities "
-                f"| domains={result['affected_domains']}"
-            )
+            logging.info(f"[ReflexAgent] MCP OK: {len(result['entity_details'])} entities | domains={result['affected_domains']}")
             return result
         except Exception as e:
-            logging.warning(f"[ReflexAgent] MCP Toolbox call failed: {e} → Spanner direct")
+            logging.warning(f"[ReflexAgent] MCP Toolbox call failed: {e} -> Spanner direct")
     else:
-        logging.info(
-            f"[ReflexAgent] MCP Toolbox not running at {_TOOLBOX_URL} "
-            f"→ trying Spanner direct"
-        )
+        logging.info(f"[ReflexAgent] MCP Toolbox not running at {_TOOLBOX_URL} -> trying Spanner direct")
 
     if _SPANNER_INSTANCE and _SPANNER_DATABASE:
         try:
-            logging.info(
-                f"[ReflexAgent] Spanner direct: "
-                f"{_SPANNER_INSTANCE}/{_SPANNER_DATABASE}"
-            )
+            logging.info(f"[ReflexAgent] Spanner direct: {_SPANNER_INSTANCE}/{_SPANNER_DATABASE}")
             result = _query_spanner_direct(eids)
-            logging.info(
-                f"[ReflexAgent] Spanner OK: {len(result['entity_details'])} entities "
-                f"| domains={result['affected_domains']}"
-            )
+            logging.info(f"[ReflexAgent] Spanner OK: {len(result['entity_details'])} entities | domains={result['affected_domains']}")
             return result
         except Exception as e:
-            logging.warning(
-                f"[ReflexAgent] Spanner direct failed: {e} → structural mock"
-            )
+            logging.warning(f"[ReflexAgent] Spanner direct failed: {e} -> structural mock")
 
     logging.info("[ReflexAgent] Using structural mock (no Spanner/MCP available)")
     return _query_spanner_mock(eids)
 
 
-# ── EID resolution from GNN result ────────────────────────────────────────────
-
 def _resolve_eids_from_gnn(gnn_result: dict) -> list[str]:
-    """
-    Extract EIDs to query from the GNN result.
-    GNN returns node IDs (e.g. "RAN_CELL_101", "HSS_CORE_01") from its internal model.
-    These are sent to Spanner — the entity table returns the real synth EIDs if they match,
-    or the structural mock infers domain from the prefix if they don't.
-
-    No hardcoded mapping. Works with whatever EIDs the GNN/synth topology produces.
-    """
-    # GNN returns only anomalousSubgraph nodes (no nodeAnomalyScores in output)
     nodes = gnn_result.get("anomalousSubgraph", {}).get("nodes", [])
     return nodes if nodes else []
 
 
-# ── Tool 1: call_gnn_engine ────────────────────────────────────────────────────
-
 def call_gnn_engine(tool_context: ToolContext) -> str:
-    """
-    Tool 1 of 3 — NO arguments.
-
-    Slide step 4a: tools call (JSON payload) to GNN Inference Engine.
-    Slide step 4b: GNN returns:
-      - anomalousSubgraph (nodes + edges from graph traversal)
-      - nodeAnomalyScores (z-score, impact_score, criticality per node)
-      - anomalyScore (compositeScore = GNN × subscribers × revenue × ToD × app)
-      - rankedRemediationBranches (highest business impact first)
-      - impact_score (from INSIGHT.csv: z_impact/10, capped at 1.0)
-      - criticality (from INSIGHT.csv: CRITICAL/MAJOR/MINOR based on anomaly_label)
-
-    Stores in state. Does NOT push to event bus.
-    """
     state            = tool_context.state
     gnn_wrapper      = state.get(latest_key(EVT_FAILURE_NOTIFICATION), {})
     event_payload    = gnn_wrapper.get("payload", {})
     trigger_event_id = gnn_wrapper.get("event_id", "")
 
-    # Idempotency — skip if already processed this trigger
     if state.get("reflex_last_trigger_id") == trigger_event_id and trigger_event_id:
         return "GNN_SKIPPED: Already processed this trigger event"
 
     import json as _json
 
-    logging.info(
-        f"[Step 2B] EventMS → ReflexAgent | "
-        f"eventId={event_payload.get('eventId')} | "
-        f"eventType={event_payload.get('eventType', event_payload.get('event_type'))} | "
-        f"use_case={event_payload.get('useCaseId')} | "
-        f"domain={event_payload.get('probableDomain')} | "
-        f"source={event_payload.get('sourceSystem', event_payload.get('source'))}"
-    )
+    print("\n" + "=" * 65)
+    print("[Step 2B] Failure Notification -> ReflexAgent")
+    print("\n  API CALL")
+    print("  POST /trigger_event")
+    print("\n  REQUEST PAYLOAD")
+    print(_json.dumps(event_payload, indent=4))
+    print("=" * 65)
+    print(f"  Source      : {event_payload.get('sourceSystem', event_payload.get('source', 'FAILURE_INJECTION_MS'))}")
+    print(f"  Event Type  : {event_payload.get('eventType', event_payload.get('event_type', 'FailureInjectionCreateEvent'))}")
+    print(f"  Trigger     : {event_payload.get('trigger', 'N/A')}")
+    print(f"  Use Case ID : {event_payload.get('useCaseId', 'N/A')}")
+    print(f"  Domain      : {event_payload.get('domain', 'N/A')}")
+    print(f"  Affected eNBs: {event_payload.get('affected_enodebs', [])}")
+    print(f"  Core Elems  : {event_payload.get('affected_core_elements', [])}")
+    print(f"  Neighbors   : {event_payload.get('affected_neighbor_enodebs', [])}")
+    print(f"  Time        : {datetime.now(timezone.utc).isoformat()}")
+    print("\n  API RESPONSE")
+    print("  HTTP 200 OK")
+    print("\n  RESPONSE PAYLOAD")
+    print(_json.dumps({
+        "status":    "accepted",
+        "eventId":   event_payload.get("eventId"),
+        "eventType": event_payload.get("eventType", "FailureInjectionCreateEvent"),
+        "message":   "FailureInjectionCreateEvent received by ReflexAgent",
+    }, indent=4))
+    print("-" * 65)
 
-    logging.info(
-        f"[Step 2B] FailureInjectionCreateEvent Payload | "
-        f"{_json.dumps(event_payload, default=str)}"
-    )
-
-    # ── Step 4a: ReflexAgent → GNN Inference Engine (tool call + JSON) ──────
-    # Build the GNN prompt inline from the 2b payload fields
     import uuid as _uuid
     gnn_prompt = {
         "eventId": event_payload.get("eventId"),
@@ -477,7 +359,6 @@ def call_gnn_engine(tool_context: ToolContext) -> str:
         "request_time":  datetime.now(timezone.utc).isoformat(),
         "trigger_source": event_payload.get("sourceSystem",
                            event_payload.get("source", "FAILURE_INJECTION_MS")),
-        # Fields from 2b FailureInjectionCreateEvent
         "trigger":                   event_payload.get("trigger", ""),
         "use_case_id":               event_payload.get("useCaseId", ""),
         "probable_domain":           event_payload.get("probableDomain", ""),
@@ -487,7 +368,6 @@ def call_gnn_engine(tool_context: ToolContext) -> str:
         "affected_layers":           event_payload.get("affected_layers", []),
         "all_affected_entities": (
             event_payload.get("affected_enodebs", []) +
-            # FIX 1: read "affected_core_elements" (was "core_elements" — wrong key)
             event_payload.get("affected_core_elements", [])
         ),
         "failure_event_type": event_payload.get("eventType",
@@ -499,97 +379,77 @@ def call_gnn_engine(tool_context: ToolContext) -> str:
             "impact_score, and criticality."
         ),
     }
-    
-    logging.info(
-        f"[Step 4A] ReflexAgent → GNN Inference Engine | "
-        f"eventId={gnn_prompt.get('eventId')} | "
-        f"use_case={gnn_prompt.get('use_case_id')} | "
-        f"entities={len(gnn_prompt.get('all_affected_entities', []))}"
-    )
+    print("[Step 4a] ReflexAgent -> GNN Inference Engine")
+    print("  Action : tools call with JSON payload")
+    print("-" * 65)
+    print("\n  API CALL")
+    print("  POST /analyze-anomaly")
+    print("\n  REQUEST PAYLOAD")
+    print("  JSON payload sent to GNN Inference Engine:")
+    print(_json.dumps({
+        "eventId":                    gnn_prompt["eventId"],
+        "prompt_type":                gnn_prompt["prompt_type"],
+        "source_agent":               gnn_prompt["source_agent"],
+        "request_id":                 gnn_prompt["request_id"],
+        "request_time":               gnn_prompt["request_time"],
+        "trigger_source":             gnn_prompt["trigger_source"],
+        "trigger":                    gnn_prompt["trigger"],
+        "use_case_id":                gnn_prompt["use_case_id"],
+        "affected_enodebs":           gnn_prompt["affected_enodebs"],
+        "affected_neighbor_enodebs":  gnn_prompt["affected_neighbor_enodebs"],
+        "core_elements":              gnn_prompt["core_elements"],
+        "message":                    gnn_prompt["message"],
+    }, indent=4))
+    print("-" * 65)
 
-    logging.info(
-        f"[Step 4A] GNN Request Payload | "
-        f"{_json.dumps(gnn_prompt, default=str)}"
-    )
+    gnn_result = prompt_gnn_engine(gnn_prompt)
 
-    if GNN_INFERENCE_URL:
-        gnn_url = f"{GNN_INFERENCE_URL.rstrip('/')}/analyze-anomaly"
-        logging.info(
-            f"[Step 4A] ReflexAgent -> GNN Inference Engine | "
-            f"eventId={gnn_prompt.get('eventId')} | url={gnn_url}"
-        )
-        response = requests.post(
-            gnn_url,
-            json=gnn_prompt,
-            timeout=60,
-        )
-        response.raise_for_status()
-        gnn_result = response.json()
-    else:
-        logging.info("[Step 4A] GNN_INFERENCE_URL not configured; using local mock")
-        gnn_result = prompt_gnn_engine(gnn_prompt)
-    # Read ONLY the 4 clean output fields from GNN (Step 4b)
-    # GNN internal calculations (anomalyImpactRanking, nodeAnomalyScores etc)
-    # are handled inside GNN — not exposed in output
     nodes        = gnn_result.get("anomalousSubgraph", {}).get("nodes", [])
     edges        = gnn_result.get("anomalousSubgraph", {}).get("edges", [])
-    ranked_list  = gnn_result.get("rankedList", [])   # rank + node_id from GNN
-    impact_score = gnn_result.get("impact_score", 0.94)     # INSIGHT.csv z_impact/10
+    ranked_list  = gnn_result.get("rankedList", [])
+    impact_score = gnn_result.get("impact_score", 0.94)
     criticality_score = gnn_result.get("criticality_score", 1.0)
     criticality_label = gnn_result.get("criticality_label", "CRITICAL")
 
-    # ── Obs 1: Augment subgraph edges with neighbor overflow connections ───────
     neighbor_enodebs = event_payload.get("affected_neighbor_enodebs", [])
     if neighbor_enodebs and nodes:
-        # Connect each neighbor to the closest anomalous node by list position
         for i, nbr in enumerate(neighbor_enodebs):
             anchor_node = nodes[min(i, len(nodes) - 1)]
             edges = list(edges) + [[anchor_node, nbr]]
 
-    # composite_score derived from impact_score for state storage and display
-    # ReflectionAgent uses pre_action_z_score for post-action comparison
     composite_score = round(impact_score * 10, 1)
 
-    logging.info(
-        f"[Step 4B] GNN Inference Engine → ReflexAgent | "
-        f"eventId={event_payload.get('eventId')} | "
-        f"impact_score={impact_score} | "
-        f"criticality={criticality_label} | "
-        f"ranked_nodes={len(ranked_list)} | "
-        f"subgraph_nodes={len(nodes)}"
-    )
-
-    gnn_response_log = {
+    print("[Step 4b] GNN Inference Engine -> ReflexAgent")
+    print("  Action : GNN anomalous subgraph + ranked list + impact score + criticality score")
+    print("-" * 65)
+    print("\n  API RESPONSE")
+    print("  HTTP 200 OK")
+    print("\n  RESPONSE PAYLOAD")
+    print("  JSON payload received from GNN Inference Engine:")
+    print(_json.dumps({
         "anomalousSubgraph": {
-            "nodes": nodes,
-            "edges": edges,
+            "nodes":          nodes,
+            "edges":          edges,
             "neighbor_nodes": neighbor_enodebs,
         },
-        "rankedList": ranked_list,
-        "impact_score": impact_score,
+        "rankedList":        ranked_list,
+        "impact_score":      impact_score,
         "criticality_score": criticality_score,
         "criticality_label": criticality_label,
-    }
-    logging.info(
-        f"[Step 4B] GNN Response Payload | "
-        f"{_json.dumps(gnn_response_log, default=str)}"
-    )
+    }, indent=4))
+    print("=" * 65)
 
-    # Store in state — downstream tools read from here
-    # Store the clean GNN result + parsed fields for perform_triage and EngineerAgent
     state["latest_gnn_result"] = {
         "anomalousSubgraph": gnn_result.get("anomalousSubgraph", {}),
         "rankedList":  ranked_list,
         "impact_score":      impact_score,
         "criticality_score": criticality_score,
-        "criticality_label": criticality_label, 
-        # compositeScore stored for ReflectionAgent pre/post z-score comparison
+        "criticality_label": criticality_label,
         "anomalyScore": {"compositeScore": composite_score, "zScore": composite_score, "confidence": 0.97},
-        # Keep businessPriority for priority routing
         "businessPriority": "CRITICAL" if impact_score >= 0.6 else "HIGH" if impact_score >= 0.3 else "MEDIUM",
     }
     state["reflex_last_trigger_id"] = trigger_event_id
-    state["pre_action_z_score"]     = composite_score  # ReflectionAgent uses this
+    state["pre_action_z_score"]     = composite_score
     state[NETWORK_STATUS_KEY]       = "ANOMALY_DETECTED"
 
     return (
@@ -599,28 +459,13 @@ def call_gnn_engine(tool_context: ToolContext) -> str:
     )
 
 
-# ── Tool 2: perform_triage ─────────────────────────────────────────────────────
-
 def perform_triage(tool_context: ToolContext) -> str:
-    """
-    Tool 2 of 3 — NO arguments.
-
-    Slide step 5:
-      - MCP/tools call to Spanner DB for entity domain metadata + impact radius
-      - Domain triage: RAN / CORE / TRANSPORT / CROSS_DOMAIN
-      - Maps GNN ranked list → domain priority ranking (HIGH/MEDIUM/LOW)
-      - Prepares 6 fields for Detective Agent
-
-    EID resolution: GNN node IDs → Spanner entity table → real EIDs.
-    No hardcoded EID mapping. Works with any topology size from synth data.
-    """
     state      = tool_context.state
     gnn_result = state.get("latest_gnn_result", {})
 
     if not gnn_result or "anomalousSubgraph" not in gnn_result:
         return "TRIAGE_ERROR: GNN result not found. Run call_gnn_engine first."
 
-    # Read the 4 clean GNN output fields stored by call_gnn_engine
     nodes        = gnn_result.get("anomalousSubgraph", {}).get("nodes", [])
     edges        = gnn_result.get("anomalousSubgraph", {}).get("edges", [])
     ranked_list  = gnn_result.get("rankedList", [])
@@ -628,15 +473,13 @@ def perform_triage(tool_context: ToolContext) -> str:
     criticality_label = gnn_result.get("criticality_label", "CRITICAL")
     criticality_score = gnn_result.get("criticality_score", 1.0)
 
-    # compositeScore for priority thresholds and ReflectionAgent z-score
     anomaly_score   = gnn_result.get("anomalyScore", {})
     composite_score = float(
         anomaly_score.get("compositeScore") or anomaly_score.get("zScore")
         or round(impact_score * 10, 1)
     )
 
-    # Priority from impact_score (high impact → P1)
-    from app.config.remediation_config import get_priority_flag, PRIORITY_FLAG_TO_EXTERNAL
+    from ran_healing_shared.remediation_config import get_priority_flag, PRIORITY_FLAG_TO_EXTERNAL
     priority_flag     = get_priority_flag(composite_score)
     priority_external = PRIORITY_FLAG_TO_EXTERNAL.get(priority_flag, "CRITICAL")
 
@@ -647,10 +490,6 @@ def perform_triage(tool_context: ToolContext) -> str:
         }
         return f"TRIAGE_BELOW_THRESHOLD: compositeScore={composite_score}"
 
-    # ── Entity ID resolution ──────────────────────────────────────────────
-    # Priority 1: affected_enodebs + affected_core_elements from 2b payload (real synth EIDs)
-    # These come directly from the FailureInjectionCreateEvent — most accurate source
-    # Priority 2: GNN node IDs → Spanner lookup (fallback)
     failure_event = state.get(latest_key(EVT_FAILURE_NOTIFICATION), {})
     failure_payload = failure_event.get("payload", {})
     affected_enodebs_2b = failure_payload.get("affected_enodebs", [])
@@ -658,28 +497,19 @@ def perform_triage(tool_context: ToolContext) -> str:
     neighbor_enodebs_2b = failure_payload.get("affected_neighbor_enodebs", [])
     all_entities_2b     = affected_enodebs_2b + core_elements_2b
 
-    # Resolve EIDs to query Spanner with. Use the union of the initial 2b
-    # entities and GNN-expanded subgraph nodes so domain triage stays dynamic
-    # when GNN discovers additional impacted nodes.
-    query_eids = list(dict.fromkeys(all_entities_2b + _resolve_eids_from_gnn(gnn_result)))
+    query_eids = all_entities_2b if all_entities_2b else _resolve_eids_from_gnn(gnn_result)
 
     toolbox_up = _is_toolbox_running()
-
-    logging.info(
-        f"[Step 5] ReflexAgent → MCP/Spanner | "
-        f"eventId={failure_payload.get('eventId')} | "
-        f"toolbox_running={toolbox_up} | "
-        f"spanner={_SPANNER_INSTANCE}/{_SPANNER_DATABASE} | "
-        f"query_entities={query_eids}"
-    )
+    print("\n[ReflexAgent - Step 5] MCP/tools call to Spanner DB")
+    print(f"  MCP Toolbox : {'RUNNING at ' + _TOOLBOX_URL if toolbox_up else 'NOT RUNNING - using fallback'}")
+    print(f"  Spanner     : {_SPANNER_INSTANCE}/{_SPANNER_DATABASE}")
+    print(f"  Query EIDs  : {query_eids}")
+    print(f"  Source      : {'2b payload (real synth EIDs)' if all_entities_2b else 'GNN node IDs (fallback)'}")
+    print("  Tools       : query_entity_domains, query_entity_connections, query_neighbor_cells")
 
     spanner_data   = _query_spanner_impact_radius(query_eids)
-    # node_score_map not available (GNN gives rank only)
-    # We use ranked_list order + nodes order for priority assignment
-    node_score_map = {}  # rank-only from GNN — no per-node scores in output
+    node_score_map = {}
 
-    # Build per-node domain map using Spanner results
-    # entity_ids for Detective Agent = real synth EIDs (from 2b or Spanner lookup)
     entity_ids       = []
     node_domains     = {}
     affected_domains = set()
@@ -696,8 +526,6 @@ def perform_triage(tool_context: ToolContext) -> str:
         if domain != "UNKNOWN":
             affected_domains.add(domain)
 
-    # entity_ids sent to Detective Agent = real synth EIDs from 2b payload
-    # (or GNN-resolved EIDs if 2b had none)
     entity_ids = all_entities_2b if all_entities_2b else [
         spanner_data["entity_details"].get(n, {}).get("eid", n) for n in nodes
     ]
@@ -711,10 +539,6 @@ def perform_triage(tool_context: ToolContext) -> str:
     else:
         domain_triage = infer_domain(nodes)
 
-    # Node priority ranking from GNN rankedList
-    # rankedList: [{rank:1, node_id:"RAN_CELL_101"}, {rank:2, ...}, ...]
-    # node_id from GNN matches anomalousSubgraph.nodes
-    # Rank 1 = highest business impact first
     node_priority_ranking = []
     for item in ranked_list:
         rank    = item.get("rank", 0)
@@ -730,12 +554,10 @@ def perform_triage(tool_context: ToolContext) -> str:
             "node_id":       node_id,
             "priority_flag": p_flag,
             "priority":      p_ext,
-            "impact_score":  impact_score,   # overall from GNN (INSIGHT.csv z_impact/10)
+            "impact_score":  impact_score,
             "criticality_score": criticality_score,
-            # FIX 4: standardized key to "criticality_label" (was "criticality" in fallback)
             "criticality_label": criticality_label,
         })
-    # Fallback if rankedList empty
     if not node_priority_ranking:
         for idx, node in enumerate(nodes):
             p_vals = [("P1","CRITICAL"),("P2","HIGH"),("P3","MEDIUM")]
@@ -744,14 +566,38 @@ def perform_triage(tool_context: ToolContext) -> str:
                 "rank": idx+1, "node_id": node,
                 "priority_flag": p_flag, "priority": p_ext,
                 "impact_score": impact_score,
-                # FIX 4: standardized key to "criticality_label" (was "criticality" — wrong key)
                 "criticality_label": criticality_label,
             })
     node_priority_ranking.sort(key=lambda x: x["rank"])
     scoring_factors = {}
 
+    print("\n" + "=" * 65)
+    print("[ReflexAgent - Step 5] DOMAIN TRIAGE RESULT")
+    print("=" * 65)
+    print(f"  Data Source   : {spanner_data['source']}")
+    print(f"  Tables queried: {spanner_data['tables_queried']}")
+    print(f"  Impact Radius : {spanner_data['impact_radius']} nodes")
+    print("")
+    print("  Per-node domain (Spanner entity table):")
+    print(f"  {'Node ID (EID)':<30} {'Domain':<14} {'Entity Type':<14}")
+    print(f"  {'-'*30} {'-'*14} {'-'*14}")
+    for node in nodes:
+        eid_info = spanner_data["entity_details"].get(node, {})
+        eid      = eid_info.get("eid", node)
+        dom      = node_domains.get(node, "UNKNOWN")
+        etype    = eid_info.get("entity_type", "N/A")
+        print(f"  {eid:<30} {dom:<14} {etype:<14}")
 
-    # node_priority_ranking comes from rankedList (GNN ranks each node by business impact)
+    print(f"\n  Domains detected  : {affected_domains_list}")
+    print(f"  Triage conclusion : {domain_triage}")
+
+    print("\n  Node priority ranking (from GNN rankedList):")
+    print(f"  {'Rank':<6} {'Node ID (EID)':<32} {'Priority':<12} {'Impact':<8} Criticality")
+    print(f"  {'-'*6} {'-'*32} {'-'*12} {'-'*8} {'-'*10}")
+    for r in node_priority_ranking:
+        print(f"  {r['rank']:<6} {r['node_id']:<32} {r['priority']:<12} "
+              f"{str(r['impact_score']):<8} {r['criticality_label']}")
+
     entity_ids_with_priority = [
         {
             "node_id":       r["node_id"],
@@ -761,15 +607,23 @@ def perform_triage(tool_context: ToolContext) -> str:
         }
         for r in node_priority_ranking
     ]
-    # overall priority_flag = from rank-1 node (highest business impact)
     overall_priority_flag = node_priority_ranking[0]["priority_flag"] if node_priority_ranking else "P1"
 
+    print(f"\n  6 fields -> Detective Agent (Slide Step 5):")
+    for e in entity_ids_with_priority:
+        print(f"      rank={e['rank']} | {e['node_id']} | {e['priority_flag']} | {e['priority']}")
+    print(f"    domain_triage     : {domain_triage}")
+    print(f"    priority_flag     : {overall_priority_flag}")
+    print(f"    priority          : {priority_external}")
+    print(f"    impact_score      : {impact_score}")
+    print(f"    criticality_score : {criticality_score}")
+    print(f"    criticality_label : {criticality_label}")
+    print(f"    reference_time    : {datetime.now(timezone.utc).isoformat()}")
+    print("=" * 65)
+
     triage_payload = {
-        # 6 core fields for Detective Agent (Slide Step 5)
-        # entity_ids: plain list of entity IDs expected by Detective Agent
-        "entity_ids":        entity_ids,
+        "entity_ids":        entity_ids_with_priority,
         "eventId": failure_payload.get("eventId"),
-        # ranked list from GNN impact ranking
         "ranked_list": node_priority_ranking,
         "domain_triage":     domain_triage,
         "priority_flag":     overall_priority_flag,
@@ -778,19 +632,15 @@ def perform_triage(tool_context: ToolContext) -> str:
         "impact_score":      impact_score,
         "criticality_score": criticality_score,
         "criticality_label": criticality_label,
-        # Extended fields (used by EngineerAgent and Orchestrator)
         "internal_priority_flag":         priority_flag,
         "priority_external":              priority_external,
         "composite_score":                composite_score,
         "composite_anomaly_impact_score": composite_score,
         "scoring_factors":                {},
         "node_priority_ranking":          node_priority_ranking,
-        "entity_ids_with_priority":       entity_ids_with_priority,
         "confidence":                     anomaly_score.get("confidence", 0.0),
-        "business_priority":              gnn_result.get("businessPriority"), 
+        "business_priority":              gnn_result.get("businessPriority"),
         "raw_nodes":                      nodes,
-        # edges from GNN anomalousSubgraph (2b→4a→4b chain) — stored alongside nodes
-        # so publish_triage can pass the complete subgraph to Detective Agent
         "raw_edges":                      edges,
         "node_domains":                   node_domains,
         "affected_domains":               affected_domains_list,
@@ -802,22 +652,6 @@ def perform_triage(tool_context: ToolContext) -> str:
     }
 
     state["triage_result"] = triage_payload
-
-    logging.info(
-        f"[Step 5] Domain Triage Complete | "
-        f"eventId={failure_payload.get('eventId')} | "
-        f"domains={affected_domains_list} | "
-        f"triage={domain_triage} | "
-        f"priority={overall_priority_flag} | "
-        f"impact_score={impact_score} | "
-        f"criticality={criticality_label}"
-    )
-
-    logging.info(
-        f"[Step 5] Triage Payload | "
-        f"{json.dumps(triage_payload, default=str)}"
-    )
-
     return (
         f"TRIAGE_COMPLETE: domains={affected_domains_list} | "
         f"result={domain_triage} | source={spanner_data['source']} | "
@@ -825,19 +659,8 @@ def perform_triage(tool_context: ToolContext) -> str:
         f"impact={impact_score} | entities={entity_ids}"
     )
 
-# ── Tool 3: publish_triage ─────────────────────────────────────────────────────
 
 def publish_triage(tool_context: ToolContext) -> str:
-    """
-    Tool 3 of 3 — NO arguments.
-
-    Publishes reflex.triage.ready to Detective Agent via event bus.
-    Idempotent — skips if already published for this trigger event.
-
-    entity_ids in detective_payload are the plain list of affected EID strings
-    expected by Detective Agent. The complete GNN node and edge context remains
-    available separately in anomalous_subgraph.
-    """
     state          = tool_context.state
     triage_payload = state.get("triage_result", {})
 
@@ -845,12 +668,8 @@ def publish_triage(tool_context: ToolContext) -> str:
         return "PUBLISH_ERROR: No triage result. Run perform_triage first."
 
     if triage_payload.get("status") == "BELOW_THRESHOLD":
-        return (
-            f"PUBLISH_SKIPPED: Score below threshold "
-            f"({triage_payload.get('composite_score')})"
-        )
+        return f"PUBLISH_SKIPPED: Score below threshold ({triage_payload.get('composite_score')})"
 
-    # Idempotency check
     gnn_wrapper  = state.get(latest_key(EVT_FAILURE_NOTIFICATION), {})
     gnn_event_id = gnn_wrapper.get("event_id", "")
     if state.get("reflex_last_event_id") == gnn_event_id and gnn_event_id:
@@ -873,14 +692,9 @@ def publish_triage(tool_context: ToolContext) -> str:
     import json as _json
     ranking = triage_payload.get("node_priority_ranking", [])
 
-    # Build the detective_payload sent to Detective Agent (Step 5 slide Out).
     detective_payload = {
         "eventId":           triage_payload.get("eventId"),
-        # entity_ids = plain list of EID strings for Detective Agent.
-        "entity_ids":        triage_payload.get("entity_ids", []),
-        # anomalous_subgraph = complete GNN output: nodes + edges (slide 4b)
-        # Slide 4b: "Anomalous subgraph: affected nodes + edges"
-        # Slide 5 IN: "GNN anomalous subgraph + ranked list" — subgraph = nodes + edges
+        "entity_ids":        triage_payload.get("raw_nodes", []),
         "anomalous_subgraph": {
             "nodes": triage_payload.get("raw_nodes", []),
             "edges": triage_payload.get("raw_edges", []),
@@ -894,53 +708,30 @@ def publish_triage(tool_context: ToolContext) -> str:
         "reference_time":    triage_payload.get("reference_time"),
     }
 
-    if not DETECTIVE_AGENT_URL:
-        logging.error("[Step 5 OUT] DETECTIVE_AGENT_URL is not configured")
-        return "DETECTIVE_URL_MISSING: DETECTIVE_AGENT_URL environment variable is required"
-
-    detective_url = f"{DETECTIVE_AGENT_URL}/investigate"
-
-    try:
-        response = requests.post(
-            detective_url,
-            json=detective_payload,
-            timeout=30,
-        )
-
-        response.raise_for_status()
-
-        detective_response = response.json()
-
-        state["detective_response"] = detective_response
-
-    except Exception as e:
-        logging.exception(
-            f"[Step 5 OUT] DetectiveAgent call failed | "
-            f"eventId={triage_payload.get('eventId')} | "
-            f"error={str(e)}"
-        )
-
-        return f"DETECTIVE_CALL_FAILED: {str(e)}"
-
-    
-
-    logging.info(
-        f"[Step 5 OUT] ReflexAgent → DetectiveAgent | "
-        f"eventId={triage_payload.get('eventId')} | "
-        f"url={detective_url} | "
-        f"priority={triage_payload.get('priority')} | "
-        f"domain={triage_payload.get('domain_triage')}"
-    )
-
-    logging.info(
-        f"[Step 5 OUT] Detective Request Payload | "
-        f"{_json.dumps(detective_payload, default=str)}"
-    )
-
-    logging.info(
-        f"[Step 5 OUT] Detective Response Payload | "
-        f"{_json.dumps(detective_response, default=str)}"
-    )
+    print("\n" + "=" * 65)
+    print("[Step 5] ReflexAgent -> Detective Agent")
+    print("=" * 65)
+    print("\n  API CALL")
+    print("  POST /investigation-request")
+    print("\n  REQUEST PAYLOAD")
+    print(_json.dumps(detective_payload, indent=4))
+    print("=" * 65)
+    print(f"  Affected Domains  : {triage_payload.get('affected_domains')}")
+    print(f"  Domain Triage     : {triage_payload.get('domain_triage')}")
+    print(f"  Priority Flag     : {triage_payload.get('priority_flag')}")
+    print(f"  Priority          : {triage_payload.get('priority')}")
+    print(f"  Impact Score      : {triage_payload.get('impact_score')}")
+    print(f"  Criticality       : {triage_payload.get('criticality_score')}")
+    print(f"  Affected Entities : {triage_payload.get('raw_nodes', [])}")
+    print(f"  Impact Radius     : {triage_payload.get('spanner_impact_radius')} nodes")
+    print(f"  Data Source       : {triage_payload.get('spanner_source')}")
+    print("")
+    print("  Node priority ranking (-> Detective Agent A2A):")
+    for r in ranking:
+        print(f"    Rank {r['rank']} | {r['node_id']} | {r['priority_flag']} | "
+              f"impact={r['impact_score']} | criticality={r['criticality_label']}")
+    print(f"\n  Next Step: Detective Agent (Ericsson) via A2A API")
+    print("=" * 65)
 
     return (
         f"PUBLISHED: reflex.triage.ready | "

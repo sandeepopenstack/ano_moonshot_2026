@@ -1,6 +1,7 @@
 """
 app/agents/engineer_agent/tools.py
 ====================================
+EngineerAgent — single tool: generate_healing_plan.
 """
 
 import uuid
@@ -14,14 +15,14 @@ logging.basicConfig(level=logging.INFO)
 from datetime import datetime, timezone
 from google.adk.tools import ToolContext
 
-from ran_healing_shared.events import (
+from app.events import (
     EVT_DETECTIVE_RCA_CONFIRMED,
     NETWORK_STATUS_KEY,
     consume_latest,
     make_engineer_event,
     publish_event,
 )
-from ran_healing_shared.remediation_config import UTILITY_SCORING
+from app.config.remediation_config import UTILITY_SCORING
 
 EXECUTOR_AGENT_URL = os.environ.get("EXECUTOR_AGENT_URL")
 
@@ -34,8 +35,20 @@ def _compute_utility(
     risk_score:        float,
     reversibility:     float,
 ) -> float:
- 
-    return round(impact_score * criticality_score * (1.0 - risk_score) * reversibility,4,)
+    """
+    Slide 7 utility formula:
+      Utility = impact_score x criticality_score x (1 - risk) x reversibility
+
+    All four inputs come directly from the Detective Agent payload:
+      impact_score       -> INSIGHT.csv z_impact/10, forwarded by Detective
+      criticality_score  -> INSIGHT.csv criticality numeric, forwarded by Detective
+      risk_score         -> CHANGEREQUEST.csv + YAML resolution.risk_score
+      reversibility      -> CHANGEREQUEST.csv + YAML resolution.reversibility_score
+    """
+    return round(
+        impact_score * criticality_score * (1.0 - risk_score) * reversibility,
+        4,
+    )
 
 
 def _priority_from_utility(utility: float) -> str:
@@ -61,6 +74,18 @@ def _build_intent_id(rca: dict) -> str:
 # ── Parse Detective Agent RCA payload ─────────────────────────────────────────
 
 def _parse_rca(raw: dict) -> dict:
+    """
+    Parse the Detective Agent RCA payload (investigation.rca.confirmed).
+    Strictly follows Doc2 Detective Agent output schema.
+
+    kpi_delta_pct resolution:
+      1. raw['kpi_impact']['primary_metric_delta_pct']  - Doc2 canonical location
+      2. raw['kpi_delta_pct']                           - root-level shortcut
+      3. UTILITY_SCORING['default_kpi_delta_pct']       - fallback (30.0)
+
+    confirmedRcaBranches: Detective Agent returns camelCase.
+    Fallback to snake_case for forward compatibility.
+    """
     kpi_impact = raw.get("kpi_impact", {})
     raw_delta  = (
         kpi_impact.get("primary_metric_delta_pct")
@@ -133,6 +158,28 @@ def _parse_rca(raw: dict) -> dict:
 # ── Build utility-scored branches ──────────────────────────────────────────────
 
 def _build_branches(rca: dict) -> list[dict]:
+    """
+    Build one branch per suggested_remediation option from Detective Agent.
+    Score each with the utility formula. Sort descending. Assign sequence.
+
+    Each suggested_remediation option (Doc2 schema):
+      {option, action, target, param, value, direction, note}
+
+    Utility differentiation across options:
+      Option A (idx=0): base risk_score         -> highest utility -> Sequence 1
+      Option B (idx=1): risk_score + 0.10       -> lower  utility -> Sequence 2
+      Option C (idx=2): risk_score + 0.20       -> lowest utility -> Sequence 3
+
+    accept_degradation: additional +0.20 risk penalty on top of index penalty
+      -> always ends up last regardless of option letter.
+
+    Cross-domain (confirmedRcaBranches populated by Detective Agent):
+      Each branch carries its own domain-specific risk_score + reversibility.
+      Utility computed independently per branch -> meaningful cross-domain ranking.
+
+    Fallback (no suggested_remediation, no confirmedRcaBranches):
+      Single branch wrapping the RCA payload - Executor decides action.
+    """
     impact_score       = rca["impact_score"]
     criticality_score  = rca["criticality_score"]
     base_risk          = rca["risk_score"]

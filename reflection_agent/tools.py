@@ -1,6 +1,27 @@
 """
 app/agents/reflection_agent/tools.py
 ======================================
+ReflectionAgent — 2 tools in sequence.
+
+Slide 10 implementation:
+  check_execution_result  → parses ExecutorAgent output (TMF641 v5 + TMF921)
+  evaluate_and_publish    → validates post-remediation network state,
+                            publishes reflection.result (IMO_COMPLIES or RETRIGGER)
+
+Validation — 3 gates defined, Gate 1 active for now:
+
+  Gate 1 — Execution OK                          [ACTIVE]
+    Source : ExecutorAgent payload (Doc2)
+    Check  : success == True AND state == "completed"
+    Why    : Without successful execution nothing else is meaningful.
+
+  resolved = Gate1 
+
+Executor Agent output schema (Doc2):
+  success, state, activation_id, intent_id, error,
+  tmf921_intent.expressions, tmf921_intent.target_entities,
+  tmf921_intent.domain, tmf921_intent.root_cause,
+  tmf641_order.order_items[].service.service_characteristics
 """
 
 import json
@@ -140,7 +161,6 @@ def _invoke_tool(tool_name: str, params: dict) -> list[dict]:
     except Exception as e:
         logging.warning(f"[MCP] {tool_name} failed: {e}")
         return []
-
 
 
 # ── Retrigger payload builder ──────────────────────────────────────────────────

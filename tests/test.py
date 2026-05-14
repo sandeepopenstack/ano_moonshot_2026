@@ -49,7 +49,7 @@ USE_CASE_ID = os.environ.get("USE_CASE_ID", "uc1")
 trigger_payload = build_trigger_event(use_case_id=USE_CASE_ID)
 
 print("\n")
-separator("STEP 2b: FailureInjectionMS \u2192 ReflexAgent")
+separator("STEP 2b: FailureInjectionMS -> ReflexAgent")
 print(f"  Source      : {trigger_payload['sourceSystem']}")
 print(f"  Event Type  : {trigger_payload['eventType']}")
 print(f"  Trigger     : {trigger_payload['trigger']}")
@@ -66,24 +66,24 @@ state = {
 ctx = FakeCtx(state)
 
 print("\n" + "=" * 65)
-print("  PIPELINE TEST \u2014 No LLM \u2014 Instant")
+print("  PIPELINE TEST - No LLM - Instant")
 print("=" * 65)
-print(f"  Trigger : {trigger_payload['sourceSystem']} \u2192 {trigger_payload['eventType']}")
-print(f"  Use Case: {trigger_payload['useCaseId']} \u2014 {trigger_payload.get('label', '')}")
+print(f"  Trigger : {trigger_payload['sourceSystem']} -> {trigger_payload['eventType']}")
+print(f"  Use Case: {trigger_payload['useCaseId']} - {trigger_payload.get('label', '')}")
 print(f"  Domain  : {trigger_payload['domain']}")
-print(f"  Note    : Zero API calls \u2014 pure Python logic test")
+print(f"  Note    : Zero API calls - pure Python logic test")
 
 
-separator("STEP 1: ReflexAgent (call_gnn_engine \u2192 perform_triage \u2192 publish_triage)")
+separator("STEP 1: ReflexAgent (call_gnn_engine -> perform_triage -> publish_triage)")
 
 r1 = call_gnn_engine(ctx)
-print(f"\n  call_gnn_engine  \u2192 {r1}")
+print(f"\n  call_gnn_engine  -> {r1}")
 
 r2 = perform_triage(ctx)
-print(f"  perform_triage   \u2192 {r2}")
+print(f"  perform_triage   -> {r2}")
 
 r3 = publish_triage(ctx)
-print(f"  publish_triage   \u2192 {r3}")
+print(f"  publish_triage   -> {r3}")
 
 reflex_event   = state.get(latest_key(EVT_REFLEX_TRIAGE_READY), {})
 reflex_payload = reflex_event.get("payload", {})
@@ -162,13 +162,13 @@ print(f"  intent_id        : {exec_output.get('intent_id')}")
 print(f"\n   ExecutorAgent mock published: {exec_event['event_type']}")
 
 
-separator("STEP 5: ReflectionAgent (check_execution_result \u2192 evaluate_and_publish)")
+separator("STEP 5: ReflectionAgent (check_execution_result -> evaluate_and_publish)")
 
 r5 = check_execution_result(ctx)
-print(f"\n  check_execution_result \u2192 {r5}")
+print(f"\n  check_execution_result -> {r5}")
 
 r6 = evaluate_and_publish(ctx)
-print(f"  evaluate_and_publish   \u2192 {r6}")
+print(f"  evaluate_and_publish   -> {r6}")
 
 reflection_output = state.get("reflection_output", {})
 
