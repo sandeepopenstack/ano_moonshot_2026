@@ -1,7 +1,6 @@
 import os
 from google.adk.agents import LlmAgent
 from google.adk.tools import FunctionTool
-from agent import root_agent as engineer_agent
 from tools import generate_healing_plan
 
 _MODEL = os.environ.get("AGENT_MODEL", "gemini-2.5-flash")

@@ -79,6 +79,7 @@ from google.adk.sessions import InMemorySessionService
 
 # ── Project imports — verified against agent.py and tools.py ─────────────────
 from tools import generate_healing_plan
+from engineer_agent.agent import root_agent as engineer_agent
 
 from ran_healing_shared.events import (
     EVT_DETECTIVE_RCA_CONFIRMED,   # tools.py: consume_latest reads this

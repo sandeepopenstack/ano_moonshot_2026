@@ -85,6 +85,7 @@ from google.adk.agents.invocation_context import InvocationContext
 from google.adk.sessions import InMemorySessionService
 
 from reflex_agent.tools import call_gnn_engine, perform_triage, publish_triage
+from reflex_agent.agent import root_agent as reflex_agent
 from ran_healing_shared.events import (
     make_failure_notification_event,
     publish_event,
