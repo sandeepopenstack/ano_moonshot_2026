@@ -22,7 +22,7 @@ class _Ctx:
 @app.post("/api/reflection")
 def reflection_invoke(payload: dict):
     exec_event = {
-        "event_id": str(uuid4()),
+        "event_id": payload.get("event_id", str(uuid4())),
         "event_type": EVT_EXECUTION_COMPLETED,
         "source": "ExecutorAgent",
         "payload": payload,

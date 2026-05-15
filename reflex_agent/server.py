@@ -22,8 +22,11 @@ class _Ctx:
 
 @app.post("/api/reflex")
 def reflex_invoke(payload: dict = {}):
-    use_case = payload.get("use_case_id", "uc1")
-    trigger = build_trigger_event(use_case_id=use_case)
+    if payload and ("trigger" in payload or "affected_enodebs" in payload or "affected_core_elements" in payload):
+        trigger = payload
+    else:
+        use_case = payload.get("use_case_id", "uc1")
+        trigger = build_trigger_event(use_case_id=use_case)
     failure = make_failure_notification_event(trigger)
     state = {
         NETWORK_STATUS_KEY: "ANOMALY_DETECTED",

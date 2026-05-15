@@ -22,7 +22,7 @@ class _Ctx:
 @app.post("/api/engineer")
 def engineer_invoke(payload: dict):
     rca_event = {
-        "event_id": str(uuid4()),
+        "event_id": payload.get("event_id", str(uuid4())),
         "event_type": EVT_DETECTIVE_RCA_CONFIRMED,
         "source": "DetectiveAgent",
         "payload": payload,
