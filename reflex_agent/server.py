@@ -20,7 +20,7 @@ class _Ctx:
         self.state = state
 
 
-@app.post("/api/reflex")
+@app.post("/trigger_event")
 def reflex_invoke(payload: dict = {}):
     if payload and ("trigger" in payload or "affected_enodebs" in payload or "affected_core_elements" in payload):
         trigger = payload
@@ -43,7 +43,6 @@ def reflex_invoke(payload: dict = {}):
         "network_status": state.get(NETWORK_STATUS_KEY),
         "detective_investigation_request": reflex_event.get("payload", {}),
     }
-
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

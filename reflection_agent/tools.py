@@ -2,26 +2,6 @@
 app/agents/reflection_agent/tools.py
 ======================================
 ReflectionAgent — 2 tools in sequence.
-
-Slide 10 implementation:
-  check_execution_result  → parses ExecutorAgent output (TMF641 v5 + TMF921)
-  evaluate_and_publish    → validates post-remediation network state,
-                            publishes reflection.result (IMO_COMPLIES or RETRIGGER)
-
-Validation — 3 gates defined, Gate 1 active for now:
-
-  Gate 1 — Execution OK                          [ACTIVE]
-    Source : ExecutorAgent payload (Doc2)
-    Check  : success == True AND state == "completed"
-    Why    : Without successful execution nothing else is meaningful.
-
-  resolved = Gate1 
-
-Executor Agent output schema (Doc2):
-  success, state, activation_id, intent_id, error,
-  tmf921_intent.expressions, tmf921_intent.target_entities,
-  tmf921_intent.domain, tmf921_intent.root_cause,
-  tmf641_order.order_items[].service.service_characteristics
 """
 
 import json
@@ -49,12 +29,18 @@ from ran_healing_shared.remediation_config import (
     REFLECTION_CONFIG,
 )
 
-_GCP_PROJECT         = os.environ.get("GOOGLE_CLOUD_PROJECT", "poc-z-in2300756")
-_SPANNER_INSTANCE    = os.environ.get("SPANNER_INSTANCE", "verizon-gnn")
-_SPANNER_DATABASE    = os.environ.get("SPANNER_DATABASE", "syndata")
-_TOOLBOX_URL         = os.environ.get("TOOLBOX_URL", "http://localhost:5000").rstrip("/")
+_GCP_PROJECT      = os.environ.get("GOOGLE_CLOUD_PROJECT", "poc-z-in2300756")
+_SPANNER_INSTANCE = os.environ.get("SPANNER_INSTANCE", "verizon-gnn")
+_SPANNER_DATABASE = os.environ.get("SPANNER_DATABASE", "syndata")
+_TOOLBOX_URL      = os.environ.get("TOOLBOX_URL", "http://localhost:5000").rstrip("/")
+
+# Optional — set when GUI dashboard endpoint is ready.
+# If empty string (default), GUI POST is skipped silently — no error.
 REFLECTION_AGENT_URL = os.environ.get("REFLECTION_AGENT_URL", "").rstrip("/")
-REFLEX_AGENT_URL     = os.environ.get("REFLEX_AGENT_URL", "").rstrip("/")
+
+# Optional — set when ReflexAgent retrigger POST is needed.
+# If empty string (default), retrigger is published on ADK bus only — no error.
+REFLEX_AGENT_URL = os.environ.get("REFLEX_AGENT_URL", "").rstrip("/")
 
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
@@ -75,6 +61,44 @@ def _as_bool(value) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"true", "1", "yes", "y"}
     return bool(value)
+
+
+# ── Optional HTTP POST helper ──────────────────────────────────────────────────
+
+def _post_if_configured(url: str, payload: dict, label: str, event_id: str) -> None:
+    """
+    POST payload to url only if url is a non-empty string.
+    Logs the outcome but never raises — caller always continues.
+    Used for optional GUI dashboard and retrigger endpoints.
+    """
+    if not url:
+        logging.info(
+            f"[{label}] URL not configured — skipping POST | eventId={event_id}"
+        )
+        return
+
+    logging.info(
+        f"[{label}] POST | eventId={event_id} | url={url}"
+    )
+    logging.info(
+        f"[{label}] Request Payload | {json.dumps(payload, default=str)}"
+    )
+
+    try:
+        resp = requests.post(url, json=payload, timeout=30)
+        resp.raise_for_status()
+        logging.info(
+            f"[{label}] POST SUCCESS | eventId={event_id} | "
+            f"http_status={resp.status_code}"
+        )
+        logging.info(
+            f"[{label}] Response Payload | {json.dumps(resp.json(), default=str)}"
+        )
+    except Exception as e:
+        logging.warning(
+            f"[{label}] POST FAILED | eventId={event_id} | "
+            f"url={url} | error={str(e)}"
+        )
 
 
 # ── MCP Toolbox helpers (shared pattern with ReflexAgent) ─────────────────────
@@ -162,7 +186,6 @@ def _invoke_tool(tool_name: str, params: dict) -> list[dict]:
         logging.warning(f"[MCP] {tool_name} failed: {e}")
         return []
 
-
 # ── Retrigger payload builder ──────────────────────────────────────────────────
 
 def _build_retrigger_failure_payload(
@@ -227,10 +250,10 @@ def _build_retrigger_failure_payload(
             "useCaseId",
             "uc2" if domain == "CORE" else "uc1",
         ),
-        "domain":                  domain,
-        "affected_layers":         affected_layers,
-        "affected_core_elements":  affected_core_elements or [],
-        "affected_enodebs":        affected_enodebs or [],
+        "domain":                    domain,
+        "affected_layers":           affected_layers,
+        "affected_core_elements":    affected_core_elements or [],
+        "affected_enodebs":          affected_enodebs or [],
         "affected_neighbor_enodebs": original_payload.get(
             "affected_neighbor_enodebs", []
         ),
@@ -375,9 +398,12 @@ def evaluate_and_publish(tool_context: ToolContext) -> str:
 
       resolved = Gate1 only (Gates 2+3 will be ANDed in when enabled)
 
-    IMO_COMPLIES  → reflection.result published, network_status=RESOLVED
-    RETRIGGER     → reflection.result + Step 2b trigger event re-fired to ReflexAgent
+    IMO_COMPLIES  → reflection.result published on ADK bus, network_status=RESOLVED
+    RETRIGGER     → reflection.result published + 2b retrigger fired to ReflexAgent
     MAX_RETRIES   → pipeline stopped, network_status=FAILED
+
+    GUI POST: fires only if REFLECTION_AGENT_URL env var is set. Silent if not.
+    Retrigger POST: fires only if REFLEX_AGENT_URL env var is set. Silent if not.
     """
     state       = tool_context.state
     exec_result = state.get("reflection_exec_result", {})
@@ -424,8 +450,6 @@ def evaluate_and_publish(tool_context: ToolContext) -> str:
         f"success={exec_result.get('success')} | "
         f"state={exec_result.get('state')}"
     )
-
-    # ── Resolution  (add `and gate2_ok and gate3_ok` when gates are enabled) ─
     resolved = gate1_ok
 
     # Retrigger limit
@@ -440,8 +464,7 @@ def evaluate_and_publish(tool_context: ToolContext) -> str:
     if max_retries_reached:
         logging.warning(
             f"[Step 10] MAX RETRIGGER ATTEMPTS REACHED | "
-            f"eventId={event_id} | "
-            f"attempts={attempts} | max={max_attempts}"
+            f"eventId={event_id} | attempts={attempts} | max={max_attempts}"
         )
 
     # Retrigger reason
@@ -458,7 +481,7 @@ def evaluate_and_publish(tool_context: ToolContext) -> str:
     gui_status        = "HEALTHY_ENVIRONMENT"      if resolved else "DEGRADED_ENVIRONMENT"
     gnn_topo_view     = "STABLE_ENVIRONMENT_GRAPH" if resolved else "UNSTABLE_ENVIRONMENT_GRAPH"
     validation_status = (
-        "IMO_COMPLIES"        if resolved
+        "IMO_COMPLIES"             if resolved
         else "FAILED_AFTER_RETRIES" if max_retries_reached
         else "RETRIGGER_INVESTIGATION"
     )
@@ -491,7 +514,7 @@ def evaluate_and_publish(tool_context: ToolContext) -> str:
             ),
         },
         "validation_gates": {
-            "gate1_execution_ok": gate1_ok,
+            "gate1_execution_ok":  gate1_ok,
             # gate2_anomaly_normal: None,   # not yet active
             # gate3_not_degraded:   None,   # not yet active
         },
@@ -499,23 +522,23 @@ def evaluate_and_publish(tool_context: ToolContext) -> str:
             "pre_action_z": round(pre_z, 3),
             "baseline":     BASELINE_Z_SCORE,
         },
-        "execution_ok":    execution_ok,
-        "execution_state": exec_result.get("state"),
-        "execution_error": exec_result.get("error", ""),
-        "topology_state":  topology_state,
-        "business_view":   business_view,
-        "service_view":    service_view,
-        "gui_status":      gui_status,
+        "execution_ok":      execution_ok,
+        "execution_state":   exec_result.get("state"),
+        "execution_error":   exec_result.get("error", ""),
+        "topology_state":    topology_state,
+        "business_view":     business_view,
+        "service_view":      service_view,
+        "gui_status":        gui_status,
         "gnn_topology_view": gnn_topo_view,
-        "activation_id":   exec_result.get("activation_id"),
-        "intent_id":       exec_result.get("intent_id"),
-        "domain":          domain,
-        "root_cause":      exec_result.get("root_cause"),
-        "target_entities": target_entities,
+        "activation_id":     exec_result.get("activation_id"),
+        "intent_id":         exec_result.get("intent_id"),
+        "domain":            domain,
+        "root_cause":        exec_result.get("root_cause"),
+        "target_entities":   target_entities,
         "affected_hex_bins": affected_hex_bins,
-        "recovery_targets": exec_result.get("recovery_targets", []),
-        "retrigger_count": attempts,
-        "timestamp":       datetime.now(timezone.utc).isoformat(),
+        "recovery_targets":  exec_result.get("recovery_targets", []),
+        "retrigger_count":   attempts,
+        "timestamp":         datetime.now(timezone.utc).isoformat(),
     }
 
     if not resolved:
@@ -533,7 +556,9 @@ def evaluate_and_publish(tool_context: ToolContext) -> str:
     reflection_event["network_status"] = next_network_status
     publish_event(state, reflection_event)
 
-    # ── POST to GUI / orchestrator ────────────────────────────────────────────
+    # ── POST to GUI dashboard (optional — fires only if REFLECTION_AGENT_URL set) ─
+    # To connect GUI: set REFLECTION_AGENT_URL env var to the dashboard endpoint.
+    # If not set, this block is silently skipped — no error, no warning.
     reflection_payload = {
         "status":       validation_output["status"],
         "eventId":      event_id,
@@ -561,48 +586,12 @@ def evaluate_and_publish(tool_context: ToolContext) -> str:
         "timestamp": validation_output["timestamp"],
     }
 
-    reflection_response = {
-        "status":         validation_output["status"],
-        "resolved":       resolved,
-        "network_status": next_network_status,
-        "gui_status":     gui_status,
-        "topology_state": topology_state,
-        "gnn_topology":   gnn_topo_view,
-    }
-
-    if REFLECTION_AGENT_URL:
-        reflection_url = f"{REFLECTION_AGENT_URL}/reflection-result"
-        logging.info(
-            f"[Step 10 OUT] ReflectionAgent → GUI/Orchestrator | "
-            f"eventId={event_id} | "
-            f"url={reflection_url} | "
-            f"status={validation_output['status']}"
-        )
-        logging.info(
-            f"[Step 10 OUT] Reflection Request Payload | "
-            f"{json.dumps(reflection_payload, default=str)}"
-        )
-        try:
-            resp = requests.post(reflection_url, json=reflection_payload, timeout=30)
-            resp.raise_for_status()
-            logging.info(
-                f"[Step 10 OUT] Reflection POST SUCCESS | "
-                f"eventId={event_id} | http_status={resp.status_code}"
-            )
-            logging.info(
-                f"[Step 10 OUT] Reflection Response Payload | "
-                f"{json.dumps(resp.json(), default=str)}"
-            )
-        except Exception as e:
-            logging.warning(
-                f"[Step 10 OUT] Reflection POST FAILED | "
-                f"eventId={event_id} | url={reflection_url} | error={str(e)}"
-            )
-    else:
-        logging.info(
-            f"[Step 10 OUT] Reflection Response Payload | "
-            f"{json.dumps(reflection_response, default=str)}"
-        )
+    _post_if_configured(
+        url      = f"{REFLECTION_AGENT_URL}/reflection-result" if REFLECTION_AGENT_URL else "",
+        payload  = reflection_payload,
+        label    = "Step 10 OUT] ReflectionAgent → GUI/Orchestrator",
+        event_id = event_id,
+    )
 
     # ── Re-trigger pipeline if not resolved and under limit ───────────────────
     if not resolved and not max_retries_reached:
@@ -622,27 +611,13 @@ def evaluate_and_publish(tool_context: ToolContext) -> str:
             f"{json.dumps(retrigger_payload, default=str)}"
         )
 
-        if REFLEX_AGENT_URL:
-            retrigger_url = f"{REFLEX_AGENT_URL}/trigger_event"
-            try:
-                resp = requests.post(retrigger_url, json=retrigger_payload, timeout=30)
-                resp.raise_for_status()
-                validation_output["retrigger_post_status"] = "POSTED"
-                validation_output["retrigger_url"]         = retrigger_url
-                logging.info(
-                    f"[Step 10 OUT] ReflexAgent RETRIGGER POST SUCCESS | "
-                    f"eventId={event_id} | http_status={resp.status_code}"
-                )
-            except Exception as e:
-                validation_output["retrigger_post_status"] = "FAILED"
-                validation_output["retrigger_url"]         = retrigger_url
-                validation_output["retrigger_post_error"]  = str(e)
-                logging.warning(
-                    f"[Step 10 OUT] ReflexAgent RETRIGGER POST FAILED | "
-                    f"eventId={event_id} | url={retrigger_url} | error={str(e)}"
-                )
-        else:
-            validation_output["retrigger_post_status"] = "SKIPPED_NO_REFLEX_AGENT_URL"
+        # POST to ReflexAgent (optional — fires only if REFLEX_AGENT_URL set)
+        _post_if_configured(
+            url      = f"{REFLEX_AGENT_URL}/trigger_event" if REFLEX_AGENT_URL else "",
+            payload  = retrigger_payload,
+            label    = "Step 10 OUT] ReflexAgent RETRIGGER",
+            event_id = event_id,
+        )
 
     state["reflection_output"] = validation_output
     state[NETWORK_STATUS_KEY]  = next_network_status

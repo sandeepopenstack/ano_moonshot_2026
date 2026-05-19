@@ -19,7 +19,7 @@ class _Ctx:
         self.state = state
 
 
-@app.post("/api/engineer")
+@app.post("/rca-confirmed")
 def engineer_invoke(payload: dict):
     rca_event = {
         "event_id": payload.get("event_id", str(uuid4())),

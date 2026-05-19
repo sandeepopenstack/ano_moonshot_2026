@@ -19,7 +19,7 @@ class _Ctx:
         self.state = state
 
 
-@app.post("/api/reflection")
+@app.post("/execution-completed")
 def reflection_invoke(payload: dict):
     exec_event = {
         "event_id": payload.get("event_id", str(uuid4())),

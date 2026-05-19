@@ -24,7 +24,7 @@ from ran_healing_shared.events import (
 )
 from ran_healing_shared.remediation_config import UTILITY_SCORING
 
-EXECUTOR_AGENT_URL = os.environ.get("EXECUTOR_AGENT_URL")
+EXECUTOR_AGENT_URL = os.environ.get("EXECUTOR_AGENT_URL","http://10.63.4.22:8000/execute-healing-plan")
 
 
 # ── Utility scoring ────────────────────────────────────────────────────────────
