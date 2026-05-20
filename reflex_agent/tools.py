@@ -27,7 +27,7 @@ _SPANNER_INSTANCE = os.environ.get("SPANNER_INSTANCE", "verizon-gnn")
 _SPANNER_DATABASE = os.environ.get("SPANNER_DATABASE", "syndata")
 _TOOLBOX_URL = os.environ.get("TOOLBOX_URL", "http://localhost:5000").rstrip("/")
 GNN_INFERENCE_URL = os.environ.get("GNN_INFERENCE_URL")
-DETECTIVE_AGENT_URL = os.environ.get("DETECTIVE_AGENT_URL",	"http://10.63.4.22:8000/investigate")
+DETECTIVE_AGENT_URL = os.environ.get("DETECTIVE_AGENT_URL",	"http://10.63.4.22:8000")
 
 # ── MCP Toolbox health check ───────────────────────────────────────────────────
 
@@ -754,7 +754,8 @@ def perform_triage(tool_context: ToolContext) -> str:
     triage_payload = {
         # 6 core fields for Detective Agent (Slide Step 5)
         # entity_ids: each entity with its GNN-assigned rank and priority_flag
-        "entity_ids":        entity_ids_with_priority,
+        "entity_ids":              entity_ids,                # plain strings → what Detective receives
+        "entity_ids_with_priority": entity_ids_with_priority, # objects → internal state only
         "eventId": failure_payload.get("eventId"),
         # ranked list from GNN impact ranking
         "ranked_list": node_priority_ranking,
@@ -863,11 +864,7 @@ def publish_triage(tool_context: ToolContext) -> str:
     # Build the detective_payload sent to Detective Agent (Step 5 slide Out).
     detective_payload = {
         "eventId":           triage_payload.get("eventId"),
-        # entity_ids = GNN anomalousSubgraph.nodes (2b→4a→4b chain)
-        "entity_ids":        triage_payload.get("raw_nodes", []),
-        # anomalous_subgraph = complete GNN output: nodes + edges (slide 4b)
-        # Slide 4b: "Anomalous subgraph: affected nodes + edges"
-        # Slide 5 IN: "GNN anomalous subgraph + ranked list" — subgraph = nodes + edges
+        "entity_ids":        triage_payload.get("entity_ids"),
         "anomalous_subgraph": {
             "nodes": triage_payload.get("raw_nodes", []),
             "edges": triage_payload.get("raw_edges", []),
@@ -878,6 +875,7 @@ def publish_triage(tool_context: ToolContext) -> str:
         "priority":          triage_payload.get("priority"),
         "impact_score":      triage_payload.get("impact_score"),
         "criticality_score": triage_payload.get("criticality_score"),
+        "criticality_label": triage_payload.get("criticality_label"),
         "reference_time":    triage_payload.get("reference_time"),
     }
 
@@ -887,7 +885,7 @@ def publish_triage(tool_context: ToolContext) -> str:
         response = requests.post(
             detective_url,
             json=detective_payload,
-            timeout=30,
+            timeout=120,
         )
 
         response.raise_for_status()

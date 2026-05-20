@@ -24,7 +24,7 @@ from ran_healing_shared.events import (
 )
 from ran_healing_shared.remediation_config import UTILITY_SCORING
 
-EXECUTOR_AGENT_URL = os.environ.get("EXECUTOR_AGENT_URL","http://10.63.4.22:8000/execute-healing-plan")
+EXECUTOR_AGENT_URL = os.environ.get("EXECUTOR_AGENT_URL","http://10.63.4.22:8000")
 
 
 # ── Utility scoring ────────────────────────────────────────────────────────────
@@ -95,7 +95,7 @@ def _parse_rca(raw: dict) -> dict:
 
     return {
         # Identity
-        "eventId":                raw.get("eventId", ""),
+        "eventId": raw.get("eventId") or raw.get("event_id", ""),
         "hypothesis_id":          raw.get("hypothesis_id", ""),
         "change_request_id":      raw.get("change_request_id", ""),
         "incident_type":          raw.get("incident_type", ""),
