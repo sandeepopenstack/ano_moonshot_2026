@@ -1,6 +1,8 @@
 import os, sys, uvicorn
 from uuid import uuid4
 from google.adk.cli.fast_api import get_fast_api_app
+from log_stream import router as log_router
+from fastapi.middleware.cors import CORSMiddleware
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -13,7 +15,13 @@ from reflex_agent.tools import call_gnn_engine, perform_triage, publish_triage
 
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 app = get_fast_api_app(agents_dir=parent_dir, web=False, a2a=True)
-
+app.include_router(log_router)
+app.add_middleware(                           # for GUI team's browser calls
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
 
 class _Ctx:
     def __init__(self, state):
