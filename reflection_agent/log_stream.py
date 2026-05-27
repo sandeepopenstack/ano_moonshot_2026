@@ -1,27 +1,14 @@
 """
-log_stream.py
+app/routes/log_stream.py
 =========================
 GET /log-stream  — exposes recent structured Cloud Run logs as JSON.
 
-How it works end-to-end:
-  1. Your agent tools.py calls logging.info("[Step X] ... | key=value | ...")
-  2. Cloud Run captures those lines in Cloud Logging automatically.
-  3. The GUI calls GET /log-stream?event_id=EV-xxx every 3 seconds.
-  4. This endpoint queries Cloud Logging API for this service's recent logs,
-     parses each line into {step, event, key: value, ...}, and returns JSON.
-  5. The GUI parser reads step + key=value fields to drive the status cards.
+Same file used by all three agents. Cloud Run sets K_SERVICE automatically.
 
-Natural language log lines are parsed the same way — the [Step X] prefix
-is the classifier key, and key=value pairs at the end of the line provide
-the structured fields for the GUI pills display.
+Returns ALL agent log lines — both natural language sentences and JSON
+payload lines — so the GUI team can use whatever they need.
 
-Prerequisites:
-  pip install google-cloud-logging
-  In GCP IAM: add roles/logging.viewer to the Cloud Run service account.
-
-Registration in your FastAPI app:
-  from app.routes.log_stream import router as log_router
-  app.include_router(log_router)
+Filters OUT HTTP access logs (GET/POST lines) — only agent logs returned.
 """
 
 import os
@@ -34,7 +21,7 @@ from fastapi.responses import JSONResponse
 
 router = APIRouter()
 
-_PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT")
+_PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT", "poc-z-in2300756")
 _SERVICE = os.environ.get("K_SERVICE", "ran-reflection-test-v2")
 
 
@@ -42,28 +29,36 @@ _SERVICE = os.environ.get("K_SERVICE", "ran-reflection-test-v2")
 
 def _parse(text: str) -> dict:
     """
-    Parse one structured log line into a flat dict.
-    Handles all log line formats produced by the three agents:
+    Parse one log line into a flat dict.
+
+    [Step X] natural sentence | key=value | key=value
+      → { step, event, key: value, ... }
+
+    [Step X] JSON Payload | {...}
+      → { step, event: "JSON Payload", raw: full line }
+
+    [MCP] query_entity_domains → 5 rows
+      → { prefix: "MCP", event: "query_entity_domains → 5 rows" }
     """
     result = {"raw": text}
 
-    # [Step X] or [Step X OUT] — the primary classifier for the GUI
-    step_m = re.match(r"\[Step\s*([\w\s]+)\]", text)
+    # Extract [Step X] or [Step X OUT] tag
+    step_m = re.match(r"\[Step\s*([^\]]+)\]", text)
     if step_m:
         result["step"] = step_m.group(1).strip()
 
-    # [Word] prefix for MCP/agent lines that have no Step tag
+    # Extract [Prefix] for MCP/agent lines without a Step tag
     prefix_m = re.match(r"\[(\w+)\]", text)
     if prefix_m and not step_m:
         result["prefix"] = prefix_m.group(1)
 
-    # Human-readable event description — text inside [...] up to first |
+    # Extract human-readable event description (text after ] up to first |)
     parts = text.split("|")
     label_m = re.search(r"\]\s*(.+)$", parts[0])
     if label_m:
         result["event"] = label_m.group(1).strip()
 
-    # key=value pairs from all pipe-separated segments after the first
+    # Extract key=value pairs from all pipe-separated segments after the first
     for part in parts[1:]:
         part = part.strip()
         if "=" in part:
@@ -74,6 +69,51 @@ def _parse(text: str) -> dict:
     return result
 
 
+def _extract_text(entry) -> str | None:
+    """
+    Extract plain text from a Cloud Logging entry.
+
+    Uses entry.to_api_repr() which returns the raw Cloud Logging API dict
+    — works regardless of SDK version or entry type.
+
+    Cloud Run logging.info() calls appear as textPayload in the API repr.
+    Structured logs appear as jsonPayload.message.
+    """
+    try:
+        # Most reliable: use the raw API representation
+        api_repr = entry.to_api_repr()
+
+        # 1. textPayload — where logging.info("[Step X]...") lands in Cloud Run
+        if api_repr.get("textPayload"):
+            return api_repr["textPayload"]
+
+        # 2. jsonPayload — structured JSON logs
+        json_payload = api_repr.get("jsonPayload", {})
+        if json_payload:
+            return (
+                json_payload.get("message")
+                or json_payload.get("textPayload")
+                or json_payload.get("msg")
+                or json.dumps(json_payload)
+            )
+
+        # 3. protoPayload — admin/audit logs (rarely agent logs)
+        proto = api_repr.get("protoPayload", {})
+        if proto:
+            return proto.get("status", {}).get("message") or json.dumps(proto)
+
+    except Exception:
+        pass
+
+    # 4. Fallback: try SDK attributes directly
+    for attr in ("text_payload", "payload"):
+        val = getattr(entry, attr, None)
+        if val and isinstance(val, str):
+            return val
+
+    return None
+
+
 # ── Cloud Logging query ────────────────────────────────────────────────────────
 
 def _fetch_logs(
@@ -82,19 +122,12 @@ def _fetch_logs(
     since_minutes: int,
 ) -> list[dict]:
     """
-    Query Cloud Logging for recent log entries from this service only.
-
-    Filter chain:
-      resource.type = cloud_run_revision        → Cloud Run logs only
-      resource.labels.service_name = K_SERVICE  → this service only
-      severity >= INFO                           → skip DEBUG
-      timestamp >= now - since_minutes           → recency window
-      textPayload =~ event_id                    → optional per-run filter
+    Query Cloud Logging for recent agent log entries from this service.
+    HTTP access logs (GET /openapi.json, POST /trigger_event) are excluded.
     """
     try:
         from google.cloud import logging_v2
     except ImportError:
-        # google-cloud-logging not installed — return empty (local dev without GCP)
         return []
 
     client    = logging_v2.Client(project=_PROJECT)
@@ -104,12 +137,20 @@ def _fetch_logs(
     filter_parts = [
         'resource.type="cloud_run_revision"',
         f'resource.labels.service_name="{_SERVICE}"',
-        "severity>=INFO",
         f'timestamp>="{since_str}"',
+        # Only fetch lines that contain our structured log prefixes
+        # This excludes HTTP access logs at the Cloud Logging level
+        '(textPayload=~"\\[Step" OR textPayload=~"\\[MCP\\]" OR '
+        'textPayload=~"\\[ReflexAgent\\]" OR textPayload=~"\\[EngineerAgent\\]" OR '
+        'textPayload=~"\\[ReflectionAgent\\]" OR textPayload=~"\\[GNN\\]" OR '
+        'jsonPayload.message=~"\\[Step")',
     ]
+
     if event_id:
-        # Filter to lines that contain the eventId — lets the GUI track one run
-        filter_parts.append(f'textPayload=~"{re.escape(event_id)}"')
+        filter_parts.append(
+            f'(textPayload=~"{re.escape(event_id)}" OR '
+            f'jsonPayload.message=~"{re.escape(event_id)}")'
+        )
 
     try:
         entries = list(
@@ -124,19 +165,29 @@ def _fetch_logs(
         return [{"raw": f"[log_stream] Cloud Logging query error: {e}", "step": None}]
 
     results = []
-    for entry in reversed(entries):   # oldest-first for timeline display in GUI
-        payload = entry.payload
-        if isinstance(payload, str):
-            text = payload
-        elif isinstance(payload, dict):
-            # Structured JSON log — try to extract textPayload or message field
-            text = (
-                payload.get("textPayload")
-                or payload.get("message")
-                or json.dumps(payload)
-            )
-        else:
-            text = str(payload)
+    for entry in reversed(entries):   # oldest-first for timeline display
+        text = _extract_text(entry)
+        if not text:
+            continue
+        text = text.strip()
+
+        # Strip Python logging prefix (INFO:root:, WARNING:root:, ERROR:root:)
+        for prefix in ("INFO:root:", "WARNING:root:", "ERROR:root:",
+                       "INFO:uvicorn:", "INFO:"):
+            if text.startswith(prefix):
+                text = text[len(prefix):].strip()
+                break
+
+        # Only keep agent log lines — skip anything that slipped through
+        if not (
+            text.startswith("[Step")
+            or text.startswith("[MCP]")
+            or text.startswith("[ReflexAgent]")
+            or text.startswith("[EngineerAgent]")
+            or text.startswith("[ReflectionAgent]")
+            or text.startswith("[GNN]")
+        ):
+            continue
 
         parsed = _parse(text)
         parsed["timestamp"] = entry.timestamp.isoformat() if entry.timestamp else ""
@@ -153,33 +204,31 @@ def _fetch_logs(
 async def log_stream(
     event_id: str | None = Query(
         default=None,
-        description=(
-            "Optional eventId string to filter logs for one specific pipeline run. "
-            "E.g. EV-dekfn_efjnf_gege. Matches any log line containing this string."
-        ),
+        description="Filter to one specific pipeline run by eventId. Optional.",
     ),
     limit: int = Query(
-        default=40,
+        default=50,
         ge=1,
         le=200,
-        description="Max number of log entries to return (oldest-first within window).",
+        description="Max log entries to return. Default 50.",
     ),
     since_minutes: int = Query(
-        default=10,
+        default=60,
         ge=1,
-        le=60,
-        description="How far back to look in Cloud Logging (minutes). Default: 10.",
+        le=1440,
+        description="How far back to look in minutes. Default 60.",
     ),
 ):
     """
-    Returns recent structured log entries for this Cloud Run service.
+    Returns recent agent log entries for this Cloud Run service.
 
-    The GUI polls this endpoint every 3 seconds and uses the response to:
-      - Drive step-progress dots on the agent status cards
-      - Populate key=value pills (domain, priority, impact_score, etc.)
-      - Render the MCP sub-block (connection source, tool rows, domain badge)
-      - Feed the live log tail at the bottom
-
+    Every entry contains:
+      raw       → full original log line (natural sentence or JSON payload)
+      step      → pipeline step e.g. "2B", "4A", "4B", "5", "5 OUT", "6", "7", "10"
+      event     → clean display text (natural sentence or payload label)
+      timestamp → ISO timestamp
+      severity  → INFO / WARNING / ERROR
+      + any key=value fields extracted from the log line
     """
     logs = _fetch_logs(
         event_id=event_id,

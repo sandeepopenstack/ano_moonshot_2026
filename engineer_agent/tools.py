@@ -23,8 +23,9 @@ from ran_healing_shared.events import (
     publish_event,
 )
 from ran_healing_shared.remediation_config import UTILITY_SCORING
+from engineer_agent.step_events import emit_step   # SSE step streaming
 
-EXECUTOR_AGENT_URL = os.environ.get("EXECUTOR_AGENT_URL", "")
+EXECUTOR_AGENT_URL = os.environ.get("EXECUTOR_AGENT_URL", "http://10.63.4.22:8000").rstrip("/")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Natural language log helpers — MODULE LEVEL
@@ -67,7 +68,6 @@ def _log_6_rca_received(rca: dict) -> None:
         f"impact_score={impact} | criticality_score={rca.get('criticality_score', 0)} | "
         f"remediation_options={len(suggestions)}"
     )
-    # Full structured payload — using rca directly (same as old code)
     logging.info(
         f"[Step 6] Detective RCA Payload | "
         f"{json.dumps(rca, default=str)}"
@@ -426,7 +426,6 @@ def _build_branches(rca: dict) -> list[dict]:
         })
 
     # Sort descending by utility → assign sequence AFTER sort
-    # Sequence 1 = highest utility = Executor runs this first
     branches.sort(key=lambda b: b["utility_score"], reverse=True)
     for i, b in enumerate(branches):
         b["sequence"] = i + 1
@@ -538,14 +537,41 @@ def generate_healing_plan(tool_context: ToolContext) -> dict:
 
     # ── Step 6 IN log ─────────────────────────────────────────────────────────
     _log_6_rca_received(rca)
+    emit_step(
+        rca.get("eventId", ""),
+        "rca_received", "done",
+        meta=(f"{rca['root_cause']} · {rca['domain']} · "
+              f"confidence={rca['confidence_score']} · "
+              f"risk={rca['risk_score']} · rev={rca['reversibility_score']}"),
+        payload={"root_cause": rca["root_cause"], "domain": rca["domain"],
+                 "confidence_score": rca["confidence_score"],
+                 "risk_score": rca["risk_score"],
+                 "reversibility_score": rca["reversibility_score"]},
+    )
 
     # ── Step 7: Utility scoring + branch ranking ──────────────────────────────
+    emit_step(rca.get("eventId", ""), "utility_scoring", "running",
+        meta="Computing BIEM utility · ranking branches…")
     branches         = _build_branches(rca)
     top_utility      = branches[0]["utility_score"] if branches else 0.0
     utility_priority = _priority_from_utility(top_utility)
 
     # ── Step 7 scoring log ────────────────────────────────────────────────────
     _log_7_utility_scoring(rca, branches, top_utility, utility_priority)
+    emit_step(
+        rca.get("eventId", ""),
+        "utility_scoring", "done",
+        meta=(f"{len(branches)} {'branch' if len(branches)==1 else 'branches'} · "
+              f"top={top_utility} · priority={utility_priority} · "
+              f"seq1={branches[0].get('action','?') if branches else '?'}"),
+        payload={"branch_count": len(branches), "top_utility": top_utility,
+                 "utility_priority": utility_priority,
+                 "execution_order": [
+                     {"sequence": b.get("sequence"), "option": b.get("option",""),
+                      "action": b.get("action"), "utility_score": b.get("utility_score")}
+                     for b in branches
+                 ]},
+    )
 
     execution_order = [
         {
@@ -565,6 +591,15 @@ def generate_healing_plan(tool_context: ToolContext) -> dict:
 
     # ── Step 7 TMF921 log ─────────────────────────────────────────────────────
     _log_7_tmf921_built(rca, intent_id, utility_priority, len(tmf921["expressions"]))
+    emit_step(
+        rca.get("eventId", ""),
+        "tmf921_built", "done",
+        meta=(f"intent={intent_id} · priority={utility_priority} · "
+              f"{len(tmf921['expressions'])} KPI "
+              f"{'target' if len(tmf921['expressions'])==1 else 'targets'}"),
+        payload={"intent_id": intent_id, "priority": utility_priority,
+                 "expressions": len(tmf921["expressions"])},
+    )
 
     # ── Build Executor payload ────────────────────────────────────────────────
     executor_payload = {
@@ -619,6 +654,12 @@ def generate_healing_plan(tool_context: ToolContext) -> dict:
     # ── Step 7 OUT log: calling Executor ──────────────────────────────────────
     _log_7_out_calling_executor(rca, executor_url, intent_id, len(branches))
     _log_7_out_executor_request(executor_payload)
+    emit_step(
+        rca.get("eventId", ""),
+        "executor_called", "running",
+        meta=(f"POST {executor_url} · "
+              f"{len(branches)} {'branch' if len(branches)==1 else 'branches'}…"),
+    )
 
     try:
         response = requests.post(executor_url, json=executor_payload, timeout=60)
@@ -627,6 +668,16 @@ def generate_healing_plan(tool_context: ToolContext) -> dict:
 
         # ── Step 7 OUT log: Executor response ─────────────────────────────────
         _log_7_out_executor_response(rca, executor_response)
+        emit_step(
+            rca.get("eventId", ""),
+            "executor_called", "done",
+            meta=(f"intent={executor_response.get('intent_id', intent_id)} · "
+                  f"activation={executor_response.get('activation_id','')} · "
+                  f"state={executor_response.get('state','?')}"),
+            payload={"intent_id": executor_response.get("intent_id", intent_id),
+                     "activation_id": executor_response.get("activation_id", ""),
+                     "state": executor_response.get("state", "")},
+        )
 
         state["executor_response"] = executor_response
 
@@ -635,6 +686,8 @@ def generate_healing_plan(tool_context: ToolContext) -> dict:
             f"[Step 7 OUT] ExecutorAgent call FAILED | "
             f"eventId={rca['eventId']} | url={executor_url} | error={str(e)}"
         )
+        emit_step(rca.get("eventId", ""), "executor_called", "error",
+            meta=f"FAILED: {str(e)}")
         return {"status": "EXECUTOR_CALL_FAILED", "error": str(e)}
 
     # ── Publish event on internal ADK bus ─────────────────────────────────────

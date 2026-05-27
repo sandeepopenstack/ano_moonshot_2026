@@ -33,14 +33,14 @@ from ran_healing_shared.events import (
 from ran_healing_shared.remediation_config import (
     REFLECTION_CONFIG,
 )
+from reflection_agent.step_events import emit_step   # SSE step streaming
 
-_GCP_PROJECT      = os.environ.get("GOOGLE_CLOUD_PROJECT")
-_SPANNER_INSTANCE = os.environ.get("SPANNER_INSTANCE")
-_SPANNER_DATABASE = os.environ.get("SPANNER_DATABASE")
-_TOOLBOX_URL      = os.environ.get("TOOLBOX_URL").rstrip("/")
-
+_GCP_PROJECT        = os.environ.get("GOOGLE_CLOUD_PROJECT","poc-z-in2300756")
+_SPANNER_INSTANCE   = os.environ.get("SPANNER_INSTANCE","verizon-gnn")
+_SPANNER_DATABASE   = os.environ.get("SPANNER_DATABASE","syndata")
+_TOOLBOX_URL        = os.environ.get("TOOLBOX_URL", "http://localhost:5000").rstrip("/")
 REFLECTION_AGENT_URL = os.environ.get("REFLECTION_AGENT_URL", "").rstrip("/")
-REFLEX_AGENT_URL     = os.environ.get("REFLEX_AGENT_URL", "").rstrip("/")
+REFLEX_AGENT_URL     = os.environ.get("REFLEX_AGENT_URL", "https://ran-reflex-test-v2-761300295499.us-central1.run.app").rstrip("/")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -403,6 +403,15 @@ def check_execution_result(tool_context: ToolContext) -> str:
         action_type, domain, root_cause, priority,
         target_entities, affected_hex_bins, expressions, error,
     )
+    emit_step(
+        event_id,
+        "exec_result", "done",
+        meta=(f"activation={activation_id} · success={success} · "
+              f"state={state_str} · {domain}"),
+        payload={"activation_id": activation_id, "success": success,
+                 "state": state_str, "domain": domain,
+                 "target_entities": target_entities},
+    )
 
     state["reflection_exec_result"] = {
         "eventId":           event_id,
@@ -463,6 +472,8 @@ def evaluate_and_publish(tool_context: ToolContext) -> str:
 
     # ── Step 10 validation start log ──────────────────────────────────────────
     _log_10_validation_start(event_id, execution_ok, target_entities, domain)
+    emit_step(event_id, "gate1", "running",
+        meta="Checking execution_ok = success=True AND state=completed…")
 
     # ── Gate 1: Execution OK  [ACTIVE] ────────────────────────────────────────
     gate1_ok = execution_ok
@@ -472,6 +483,16 @@ def evaluate_and_publish(tool_context: ToolContext) -> str:
         event_id, gate1_ok,
         exec_result.get("success", False),
         exec_result.get("state", "unknown"),
+    )
+    emit_step(
+        event_id,
+        "gate1", "done" if gate1_ok else "error",
+        meta=(f"{'PASS' if gate1_ok else 'FAIL'} · "
+              f"success={exec_result.get('success')} · "
+              f"state={exec_result.get('state')}"),
+        payload={"gate1_ok": gate1_ok,
+                 "success": exec_result.get("success"),
+                 "state": exec_result.get("state")},
     )
 
     # ── Gate 2: Anomaly label  [COMMENTED OUT — enable when Spanner ready] ────
@@ -529,6 +550,14 @@ def evaluate_and_publish(tool_context: ToolContext) -> str:
     _log_10_resolution(
         event_id, resolved, gate1_ok,
         retrigger_reason, validation_status, gui_status, topology_state,
+    )
+    emit_step(
+        event_id,
+        "resolution", "done" if resolved else "error",
+        meta=(f"resolved={resolved} · status={validation_status} · "
+              f"gui={gui_status}"),
+        payload={"resolved": resolved, "status": validation_status,
+                 "gui_status": gui_status, "gate1_execution": gate1_ok},
     )
 
     # ── Build validation output ───────────────────────────────────────────────
@@ -616,6 +645,14 @@ def evaluate_and_publish(tool_context: ToolContext) -> str:
         payload  = reflection_payload,
         label    = "Step 10 OUT ReflectionAgent → GUI/Orchestrator",
         event_id = event_id,
+    )
+    emit_step(
+        event_id,
+        "published", "done",
+        meta=(f"network_status={next_network_status} · {validation_status}"),
+        payload={"status": validation_status, "resolved": resolved,
+                 "network_status": next_network_status,
+                 "activation_id": exec_result.get("activation_id", "")},
     )
 
     # ── Retrigger pipeline if not resolved and under limit ────────────────────

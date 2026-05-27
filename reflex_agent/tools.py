@@ -15,23 +15,20 @@ from ran_healing_shared.events import (
 )
 from ran_healing_shared.remediation_config import infer_domain
 from ran_healing_shared.gnn_inference_provider import prompt_gnn_engine
+from reflex_agent.step_events import emit_step   
 
 logging.basicConfig(level=logging.INFO)
 
-_GCP_PROJECT        = os.environ.get("GOOGLE_CLOUD_PROJECT")
-_SPANNER_INSTANCE   = os.environ.get("SPANNER_INSTANCE")
-_SPANNER_DATABASE   = os.environ.get("SPANNER_DATABASE")
-_TOOLBOX_URL        = os.environ.get("TOOLBOX_URL", "").rstrip("/")
+_GCP_PROJECT        = os.environ.get("GOOGLE_CLOUD_PROJECT","poc-z-in2300756")
+_SPANNER_INSTANCE   = os.environ.get("SPANNER_INSTANCE","verizon-gnn")
+_SPANNER_DATABASE   = os.environ.get("SPANNER_DATABASE","syndata")
+_TOOLBOX_URL = os.environ.get("TOOLBOX_URL", "http://localhost:5000").rstrip("/")
 GNN_INFERENCE_URL   = os.environ.get("GNN_INFERENCE_URL", "").rstrip("/")
-DETECTIVE_AGENT_URL = os.environ.get("DETECTIVE_AGENT_URL", "").rstrip("/")
-
+DETECTIVE_AGENT_URL = os.environ.get("DETECTIVE_AGENT_URL", "http://10.63.4.22:8000").rstrip("/")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Natural language log helpers — MODULE LEVEL (not nested inside tool functions)
-# Zero logic. Zero return values. Only logging.info() calls.
-# Called by the tool functions below.
+# Natural language log helpers — MODULE LEVEL
 # ══════════════════════════════════════════════════════════════════════════════
-
 def _log_2b_received(event_payload: dict) -> None:
     """Step 2B — Event received from Failure Injection / Event Trigger MS."""
     event_id     = event_payload.get("eventId", "unknown")
@@ -63,7 +60,6 @@ def _log_2b_received(event_payload: dict) -> None:
         f"{json.dumps(event_payload, default=str)}"
     )
 
-
 def _log_4a_gnn_request(gnn_prompt: dict, gnn_url: str) -> None:
     """Step 4A — Calling GNN Inference Engine."""
     event_id = gnn_prompt.get("eventId", "unknown")
@@ -90,7 +86,6 @@ def _log_4a_gnn_request(gnn_prompt: dict, gnn_url: str) -> None:
         f"[Step 4A] GNN Request Payload | "
         f"{json.dumps(gnn_prompt, default=str)}"
     )
-
 
 def _log_4b_gnn_response(
     event_payload:     dict,
@@ -136,7 +131,6 @@ def _log_4b_gnn_response(
         f"{json.dumps({'anomalousSubgraph':{'nodes':nodes,'edges':edges,'neighbor_nodes':neighbor_enodebs},'rankedList':ranked_list,'impact_score':impact_score,'criticality_score':criticality_score,'criticality_label':criticality_label}, default=str)}"
     )
 
-
 def _log_5_mcp_start(
     failure_payload:  dict,
     toolbox_up:       bool,
@@ -166,7 +160,6 @@ def _log_5_mcp_start(
         f"query_entities={query_eids}"
     )
 
-
 def _log_5_mcp_result(spanner_data: dict, event_id: str) -> None:
     """Step 5 — MCP/Spanner result."""
     source    = spanner_data.get("source", "unknown")
@@ -191,7 +184,6 @@ def _log_5_mcp_result(spanner_data: dict, event_id: str) -> None:
         f"{len(neighbors)} neighbour cell{'s' if len(neighbors) != 1 else ''}). "
         f"eventId={event_id}"
     )
-
 
 def _log_5_triage_complete(
     failure_payload:       dict,
@@ -230,13 +222,11 @@ def _log_5_triage_complete(
         f"impact_score={impact_score} | criticality={criticality_label}"
     )
 
-
 def _log_5_triage_payload(triage_payload: dict) -> None:
     logging.info(
         f"[Step 5] Triage Payload | "
         f"{json.dumps(triage_payload, default=str)}"
     )
-
 
 def _log_5_out_calling_detective(triage_payload: dict, detective_url: str) -> None:
     """Step 5 OUT — Calling Detective Agent."""
@@ -246,9 +236,9 @@ def _log_5_out_calling_detective(triage_payload: dict, detective_url: str) -> No
     entities = triage_payload.get("entity_ids", [])
 
     domain_ask = {
-        "RAN":        "which antenna parameter changed and confirm the rollback target",
-        "CORE":       "which HSS sessions are stale and confirm the clear action",
-        "TRANSPORT":  "which AGG link is down and confirm the reroute path",
+        "RAN":         "which antenna parameter changed and confirm the rollback target",
+        "CORE":        "which HSS sessions are stale and confirm the clear action",
+        "TRANSPORT":   "which AGG link is down and confirm the reroute path",
         "CROSS_DOMAIN":"the multi-domain fault chain and confirm per-domain remediation",
     }.get(domain.upper(), "root cause and confirm remediation actions")
 
@@ -260,7 +250,6 @@ def _log_5_out_calling_detective(triage_payload: dict, detective_url: str) -> No
         f"eventId={event_id} | url={detective_url} | "
         f"priority={priority} | domain={domain}"
     )
-
 
 def _log_5_out_detective_request(detective_payload: dict) -> None:
     logging.info(
@@ -537,9 +526,13 @@ def _query_spanner_mock(eids: list[str]) -> dict:
     }
 
 
-def _query_spanner_impact_radius(eids: list[str]) -> dict:
+# FIX 2: toolbox_up parameter added — prevents _is_toolbox_running() being called twice
+def _query_spanner_impact_radius(eids: list[str], toolbox_up: bool | None = None) -> dict:
     """Priority: MCP Toolbox → Spanner direct → structural mock."""
-    if _is_toolbox_running():
+    if toolbox_up is None:
+        toolbox_up = _is_toolbox_running()   # only called here if not passed in
+
+    if toolbox_up:
         try:
             logging.info(f"[ReflexAgent] MCP Toolbox at {_TOOLBOX_URL}")
             result = _query_via_mcp_toolbox(eids)
@@ -599,6 +592,21 @@ def call_gnn_engine(tool_context: ToolContext) -> str:
 
     # ── Step 2B log ───────────────────────────────────────────────────────────
     _log_2b_received(event_payload)
+    _entities_2b = (
+        event_payload.get("affected_enodebs", [])
+        + event_payload.get("affected_core_elements", [])
+        + event_payload.get("affected_transport_elements", [])
+    )
+    emit_step(
+        event_payload.get("eventId", ""),
+        "event_received", "done",
+        meta=(f"{event_payload.get('useCaseId','?').upper()} · "
+              f"{event_payload.get('probableDomain','?')} · "
+              f"entities={_entities_2b}"),
+        payload={"eventId": event_payload.get("eventId"),
+                 "domain": event_payload.get("probableDomain"),
+                 "entities": _entities_2b},
+    )
 
     # ── Step 4A: build GNN prompt ─────────────────────────────────────────────
     gnn_prompt = {
@@ -618,7 +626,6 @@ def call_gnn_engine(tool_context: ToolContext) -> str:
         "core_elements":             event_payload.get("affected_core_elements", []),
         "transport_elements":        event_payload.get("affected_transport_elements", []),
         "affected_layers":           event_payload.get("affected_layers", []),
-        # UC3 fix: include transport elements in all_affected_entities
         "all_affected_entities": (
             event_payload.get("affected_enodebs", [])
             + event_payload.get("affected_core_elements", [])
@@ -637,6 +644,13 @@ def call_gnn_engine(tool_context: ToolContext) -> str:
 
     # ── Step 4A log ───────────────────────────────────────────────────────────
     _log_4a_gnn_request(gnn_prompt, GNN_INFERENCE_URL)
+    emit_step(
+        event_payload.get("eventId", ""),
+        "gnn_request", "running",
+        meta=(f"Sending {len(gnn_prompt.get('all_affected_entities', []))} "
+              f"{'entity' if len(gnn_prompt.get('all_affected_entities', []))==1 else 'entities'} "
+              f"· {gnn_prompt.get('probable_domain','?')} · {gnn_prompt.get('use_case_id','?')}"),
+    )
 
     # ── Step 4A: call GNN ─────────────────────────────────────────────────────
     if GNN_INFERENCE_URL:
@@ -656,7 +670,6 @@ def call_gnn_engine(tool_context: ToolContext) -> str:
     criticality_score = gnn_result.get("criticality_score", 1.0)
     criticality_label = gnn_result.get("criticality_label", "CRITICAL")
 
-    # Augment edges with neighbour overflow connections
     neighbor_enodebs = event_payload.get("affected_neighbor_enodebs", [])
     if neighbor_enodebs and nodes:
         for i, nbr in enumerate(neighbor_enodebs):
@@ -670,6 +683,15 @@ def call_gnn_engine(tool_context: ToolContext) -> str:
         event_payload, nodes, edges, ranked_list,
         impact_score, criticality_label, criticality_score,
         composite_score, neighbor_enodebs,
+    )
+    emit_step(
+        event_payload.get("eventId", ""),
+        "gnn_response", "done",
+        meta=(f"impact_score={impact_score} · {criticality_label} · "
+              f"composite={composite_score} · nodes={nodes}"),
+        payload={"nodes": nodes, "impact_score": impact_score,
+                 "criticality_label": criticality_label,
+                 "composite_score": composite_score},
     )
 
     # ── Store in state ────────────────────────────────────────────────────────
@@ -741,18 +763,17 @@ def perform_triage(tool_context: ToolContext) -> str:
         }
         return f"TRIAGE_BELOW_THRESHOLD: compositeScore={composite_score}"
 
-    # ── Entity resolution from 2b payload ────────────────────────────────────
     failure_event   = state.get(latest_key(EVT_FAILURE_NOTIFICATION), {})
     failure_payload = failure_event.get("payload", {})
 
     affected_enodebs_2b   = failure_payload.get("affected_enodebs", [])
     core_elements_2b      = failure_payload.get("affected_core_elements", [])
-    transport_elements_2b = failure_payload.get("affected_transport_elements", [])   # UC3 fix
+    transport_elements_2b = failure_payload.get("affected_transport_elements", [])
     neighbor_enodebs_2b   = failure_payload.get("affected_neighbor_enodebs", [])
     all_entities_2b       = affected_enodebs_2b + core_elements_2b + transport_elements_2b
 
     query_eids = all_entities_2b if all_entities_2b else _resolve_eids_from_gnn(gnn_result)
-    toolbox_up = _is_toolbox_running()
+    toolbox_up = _is_toolbox_running()   # called ONCE here
 
     # ── Step 5 log: MCP start ─────────────────────────────────────────────────
     _log_5_mcp_start(
@@ -760,14 +781,30 @@ def perform_triage(tool_context: ToolContext) -> str:
         _SPANNER_INSTANCE or "", _SPANNER_DATABASE or "",
         query_eids,
     )
+    emit_step(
+        failure_payload.get("eventId", ""),
+        "mcp_query", "running",
+        meta=(f"{'MCP Toolbox' if toolbox_up else 'Spanner direct'} · "
+              f"querying {len(query_eids)} "
+              f"{'entity' if len(query_eids)==1 else 'entities'}: {query_eids}"),
+    )
 
-    # ── Step 5: Spanner query ─────────────────────────────────────────────────
-    spanner_data = _query_spanner_impact_radius(query_eids)
+    # ── Step 5: Spanner query — toolbox_up passed in, no second health check ──
+    spanner_data = _query_spanner_impact_radius(query_eids, toolbox_up=toolbox_up)
 
     # ── Step 5 log: MCP result ────────────────────────────────────────────────
     _log_5_mcp_result(spanner_data, failure_payload.get("eventId", "unknown"))
+    emit_step(
+        failure_payload.get("eventId", ""),
+        "mcp_query", "done",
+        meta=(f"{spanner_data['source']} · "
+              f"domains={spanner_data['affected_domains']} · "
+              f"impact_radius={spanner_data['impact_radius']}"),
+        payload={"source": spanner_data["source"],
+                 "affected_domains": spanner_data["affected_domains"],
+                 "impact_radius": spanner_data["impact_radius"]},
+    )
 
-    # ── Build domain map ──────────────────────────────────────────────────────
     node_domains     = {}
     affected_domains = set()
 
@@ -793,7 +830,6 @@ def perform_triage(tool_context: ToolContext) -> str:
     else:
         domain_triage = infer_domain(nodes)
 
-    # ── Node priority ranking ─────────────────────────────────────────────────
     node_priority_ranking = []
     for item in ranked_list:
         rank    = item.get("rank", 0)
@@ -874,6 +910,26 @@ def perform_triage(tool_context: ToolContext) -> str:
         overall_priority_flag, impact_score, criticality_label, entity_ids,
     )
     _log_5_triage_payload(triage_payload)
+    emit_step(
+        failure_payload.get("eventId", ""),
+        "domain_triage", "done",
+        meta=(f"domain={domain_triage} · "
+              f"{len(entity_ids)} {'entity' if len(entity_ids)==1 else 'entities'} · "
+              f"source={spanner_data['source']}"),
+        payload={"domain_triage": domain_triage,
+                 "entity_ids": entity_ids,
+                 "affected_domains": affected_domains_list},
+    )
+    emit_step(
+        failure_payload.get("eventId", ""),
+        "priority_flag", "done",
+        meta=(f"{overall_priority_flag} · {priority_external} · "
+              f"composite={composite_score} · impact={impact_score}"),
+        payload={"priority_flag": overall_priority_flag,
+                 "priority": priority_external,
+                 "composite_score": composite_score,
+                 "impact_score": impact_score},
+    )
 
     return (
         f"TRIAGE_COMPLETE: domains={affected_domains_list} | "
@@ -942,6 +998,11 @@ def publish_triage(tool_context: ToolContext) -> str:
     # ── Step 5 OUT log: calling Detective ─────────────────────────────────────
     _log_5_out_calling_detective(triage_payload, detective_url)
     _log_5_out_detective_request(detective_payload)
+    emit_step(
+        triage_payload.get("eventId", ""),
+        "detective_called", "running",
+        meta=f"POST {detective_url} · priority={triage_payload.get('priority')} · domain={triage_payload.get('domain_triage')}",
+    )
 
     try:
         response = requests.post(detective_url, json=detective_payload, timeout=120)
@@ -953,10 +1014,25 @@ def publish_triage(tool_context: ToolContext) -> str:
             f"[Step 5 OUT] DetectiveAgent call failed | "
             f"eventId={triage_payload.get('eventId')} | error={str(e)}"
         )
+        emit_step(
+            triage_payload.get("eventId", ""),
+            "detective_called", "error",
+            meta=f"FAILED: {str(e)}",
+        )
         return f"DETECTIVE_CALL_FAILED: {str(e)}"
 
     # ── Step 5 OUT log: Detective response ────────────────────────────────────
     _log_5_out_detective_response(triage_payload, detective_response)
+    emit_step(
+        triage_payload.get("eventId", ""),
+        "detective_called", "done",
+        meta=(f"status={detective_response.get('status', detective_response.get('state','acknowledged'))} · "
+              f"root_cause={detective_response.get('root_cause','pending')}"),
+        payload={"eventId": triage_payload.get("eventId"),
+                 "status": detective_response.get("status",
+                            detective_response.get("state","acknowledged")),
+                 "root_cause": detective_response.get("root_cause","")},
+    )
 
     return (
         f"PUBLISHED: reflex.triage.ready | "

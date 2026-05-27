@@ -6,6 +6,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 WORKDIR /app
 ENV AGENT_MODEL=gemini-2.5-flash
-EXPOSE 8000
+EXPOSE 8080
 
 CMD ["uvicorn", "reflection_agent.server:app", "--host", "0.0.0.0", "--port", "8080"]
