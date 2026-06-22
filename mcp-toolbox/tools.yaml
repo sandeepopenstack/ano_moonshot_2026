@@ -1,69 +1,79 @@
+# tools.yaml — MCP Toolbox for Databases
+# Spanner source:
+#   tmforum_xl -> tmf_node_entity and tmf_node_changerequest
+
+sources:
+  spanner-tmforum-xl:
+    kind: spanner
+    project: poc-z-in2300756
+    instance: verizon-gnn
+    database: tmforum_xl
+
 tools:
-  query_entity_domains:
-    description: "Query entity domains and network segments for a list of EIDs"
-    inputSchema:
-      type: object
-      properties:
-        eids:
-          type: array
-          items:
-            type: string
-          description: "List of entity EIDs to query"
-      required:
-        - eids
-    spanner:
-      project: "poc-z-in2300756"
-      instance: "verizon-gnn"
-      database: "syndata"
-      sql: >
-        SELECT string_field_0 AS eid,
-               string_field_1 AS entity_type,
-               string_field_2 AS network_domain,
-               string_field_3 AS network_segment
-        FROM entity
-        WHERE string_field_0 IN UNNEST(@eids)
+  query_tmf_node_entity:
+    kind: spanner-sql
+    source: spanner-tmforum-xl
+    description: >
+      Query tmf_node_entity table for entity metadata, criticality tier,
+      subscriber count, and premium subscriber count.
+      Used by ReflexAgent to calculate domain triage, impact_score,
+      criticality_score, and criticality_label.
+    parameters:
+      - name: eids
+        type: array
+        description: List of entity EIDs to query from tmf_node_entity
+        items:
+          name: eid
+          type: string
+          description: A single entity EID string
+    statement: |
+      SELECT
+        eid,
+        entity_type,
+        network_domain,
+        network_segment,
+        criticality_tier,
+        subscriber_count,
+        premium_subscriber_count
+      FROM tmf_node_entity
+      WHERE eid IN UNNEST(@eids)
 
-  query_entity_connections:
-    description: "Query edge connections between entities"
-    inputSchema:
-      type: object
-      properties:
-        eids:
-          type: array
-          items:
-            type: string
-          description: "List of source entity EIDs"
-      required:
-        - eids
-    spanner:
-      project: "poc-z-in2300756"
-      instance: "verizon-gnn"
-      database: "syndata"
-      sql: >
-        SELECT eid AS source_eid,
-               to_eid AS target_eid,
-               edge_type,
-               network_domain
-        FROM edge_entitytoentity
-        WHERE eid IN UNNEST(@eids)
+  query_tmf_node_changerequest:
+    kind: spanner-sql
+    source: spanner-tmforum-xl
+    description: >
+      Query tmf_node_changerequest table for change request validation.
+      Used by ReflectionAgent Gate 2 to verify whether a change request
+      associated with the original 2B event date has been closed or completed.
+      ReflectionAgent passes event_time from the GCS file and optionally
+      passes change_request_id.
+    parameters:
+      - name: event_time
+        type: string
+        description: Original 2B eventTime from GCS, for example 2026-06-10T10:13:30Z
 
-  query_neighbor_cells:
-    description: "Query neighbor cell relationships"
-    inputSchema:
-      type: object
-      properties:
-        eids:
-          type: array
-          items:
-            type: string
-          description: "List of entity EIDs"
-      required:
-        - eids
-    spanner:
-      project: "poc-z-in2300756"
-      instance: "verizon-gnn"
-      database: "syndata"
-      sql: >
-        SELECT eid AS source_eid, to_eid AS neighbor_eid
-        FROM edge_entitytoneighbor
-        WHERE eid IN UNNEST(@eids)
+      - name: change_request_id
+        type: string
+        description: Optional change request ID, for example CR-SYN-201. Pass empty string for date-only lookup.
+
+      - name: target_entities
+        type: array
+        description: Optional list of target entity IDs from Executor response. Accepted for ReflectionAgent contract.
+        items:
+          name: eid
+          type: string
+          description: A single target entity ID
+
+    statement: |
+      SELECT
+        change_request_id,
+        event_time,
+        close_time,
+        status,
+        change_type_name,
+        risk_score,
+        reversibility_score
+      FROM tmf_node_changerequest
+      WHERE DATE(event_time) = DATE(TIMESTAMP(@event_time))
+        AND (@change_request_id = "" OR change_request_id = @change_request_id)
+      ORDER BY event_time DESC

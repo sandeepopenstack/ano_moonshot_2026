@@ -14,7 +14,7 @@ from reflex_agent.tools import call_gnn_engine, perform_triage, publish_triage
 from reflex_agent.step_events import emit_step, _step_queues  # SSE queue lives here
 
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-app = get_fast_api_app(agents_dir=parent_dir, web=False, a2a=True)
+app = get_fast_api_app(agents_dir=parent_dir, web=False, a2a=False)
 app.include_router(log_router)
 app.add_middleware(
     CORSMiddleware,

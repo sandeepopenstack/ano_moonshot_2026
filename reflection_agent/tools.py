@@ -1,20 +1,18 @@
 """
-app/agents/reflection_agent/tools.py
-======================================
 ReflectionAgent — 2 tools in sequence.
-
-Validation — Gate 1 only (active):
+Validation:
   Gate 1: execution_ok = success AND state == "completed"
+  Gate 2: change request clearance validation from tmf_node_changerequest
+          using eventTime from GCS and MCP/Spanner fallback.
+          Gate 2 passes only when no change request remains for the same date.
 
-  Gate 2 (anomaly_label) and Gate 3 (is_degraded) are commented out.
-  Z-score comparison removed — not required while Gate 1 is the only check.
 """
 
 import json
 import os
 import logging
 import requests
-
+from google.cloud import storage
 logging.basicConfig(level=logging.INFO)
 
 from datetime import datetime, timezone
@@ -37,11 +35,16 @@ from reflection_agent.step_events import emit_step   # SSE step streaming
 
 _GCP_PROJECT        = os.environ.get("GOOGLE_CLOUD_PROJECT","poc-z-in2300756")
 _SPANNER_INSTANCE   = os.environ.get("SPANNER_INSTANCE","verizon-gnn")
-_SPANNER_DATABASE   = os.environ.get("SPANNER_DATABASE","syndata")
+_SPANNER_DATABASE   = os.environ.get("SPANNER_DATABASE","tmforum_xl")
 _TOOLBOX_URL        = os.environ.get("TOOLBOX_URL", "http://localhost:5000").rstrip("/")
 REFLECTION_AGENT_URL = os.environ.get("REFLECTION_AGENT_URL", "").rstrip("/")
 REFLEX_AGENT_URL     = os.environ.get("REFLEX_AGENT_URL", "https://ran-reflex-test-v2-761300295499.us-central1.run.app").rstrip("/")
-
+_GCS_BUCKET = os.environ.get("GCS_BUCKET", "vz-tmforum-2026")
+_GCS_BLOB_PATH = os.environ.get("GCS_BLOB_PATH","agent_persistent_data/agent-execution-properties.json")
+MCP_TOOL_CHANGE_REQUEST = os.environ.get(
+    "MCP_TOOL_CHANGE_REQUEST",
+    "query_tmf_node_changerequest"
+)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Natural language log helpers
@@ -136,7 +139,7 @@ def _log_10_resolution(
     event_id:          str,
     resolved:          bool,
     gate1_ok:          bool,
-    retrigger_reason:  str | None,
+    validation_failure_reason:  str | None,
     validation_status: str,
     gui_status:        str,
     topology_state:    str,
@@ -150,8 +153,8 @@ def _log_10_resolution(
         )
     else:
         verdict = (
-            f"Validation failed — {retrigger_reason}. "
-            f"I'll retrigger the pipeline so the agents can try again."
+            f"Validation failed — {validation_failure_reason}. "
+            f"Retrigger is disabled for this validation flow; publishing VALIDATION_FAILED."
         )
     logging.info(
         f"[Step 10] Resolution Decision for event '{event_id}'. "
@@ -160,29 +163,6 @@ def _log_10_resolution(
         f"gate1_execution={gate1_ok} | "
         f"status={validation_status} | gui={gui_status}"
     )
-
-
-def _log_10_retrigger(
-    event_id:          str,
-    attempts:          int,
-    max_attempts:      int,
-    retrigger_reason:  str,
-    retrigger_payload: dict,
-) -> None:
-    """Step 10 OUT — Retriggering the pipeline."""
-    logging.info(
-        f"[Step 10 OUT] Retriggering the healing pipeline for event '{event_id}'. "
-        f"This is attempt {attempts} of {max_attempts}. "
-        f"Reason: {retrigger_reason}. "
-        f"Firing a new failure notification so ReflexAgent can start a fresh cycle. "
-        f"eventId={event_id} | attempt={attempts}/{max_attempts} | "
-        f"reason={retrigger_reason}"
-    )
-    logging.info(
-        f"[Step 10 OUT] Retrigger Payload | "
-        f"{json.dumps(retrigger_payload, default=str)}"
-    )
-
 
 def _log_10_complete(
     event_id:          str,
@@ -201,20 +181,6 @@ def _log_10_complete(
         f"network_status={network_status}"
     )
 
-
-def _log_10_max_retries(
-    event_id:     str,
-    attempts:     int,
-    max_attempts: int,
-) -> None:
-    logging.warning(
-        f"[Step 10] MAX RETRIGGER ATTEMPTS REACHED for event '{event_id}'. "
-        f"After {attempts} attempts the network has still not recovered. "
-        f"Stopping the pipeline — manual intervention required. "
-        f"eventId={event_id} | attempts={attempts} | max={max_attempts}"
-    )
-
-
 # ── Utilities ──────────────────────────────────────────────────────────────────
 
 def _dedupe(values: list[str]) -> list[str]:
@@ -226,110 +192,377 @@ def _dedupe(values: list[str]) -> list[str]:
             out.append(value)
     return out
 
-
-def _as_bool(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in {"true", "1", "yes", "y"}
-    return bool(value)
-
-
-# ── Optional HTTP POST helper ──────────────────────────────────────────────────
-
-def _post_if_configured(url: str, payload: dict, label: str, event_id: str) -> None:
-    """POST payload to url only if url is non-empty. Never raises."""
-    if not url:
-        logging.info(
-            f"[{label}] URL not configured — skipping POST | eventId={event_id}"
-        )
-        return
-    logging.info(f"[{label}] POST | eventId={event_id} | url={url}")
-    logging.info(f"[{label}] Request Payload | {json.dumps(payload, default=str)}")
+def _read_event_time_from_gcs() -> str:
+    """
+    Read the original 2B eventTime from the GCS file written by Reflex.
+    Supports both:
+      1. {"payload": {"eventTime": "..."}}
+      2. {"eventTime": "..."}
+    """
     try:
-        resp = requests.post(url, json=payload, timeout=30)
-        resp.raise_for_status()
-        logging.info(
-            f"[{label}] POST SUCCESS | eventId={event_id} | "
-            f"http_status={resp.status_code}"
+        client = storage.Client(project=_GCP_PROJECT)
+        bucket = client.bucket(_GCS_BUCKET)
+        blob = bucket.blob(_GCS_BLOB_PATH)
+
+        raw = blob.download_as_text()
+        data = json.loads(raw)
+
+        event_time = (
+            data.get("payload", {}).get("eventTime")
+            or data.get("eventTime")
+            or data.get("payload", {}).get("event_time")
+            or data.get("event_time")
         )
-        logging.info(
-            f"[{label}] Response Payload | {json.dumps(resp.json(), default=str)}"
+
+        if event_time:
+            logging.info(
+                "[ReflectionAgent] Read eventTime from GCS | gs://%s/%s | eventTime=%s",
+                _GCS_BUCKET,
+                _GCS_BLOB_PATH,
+                event_time,
+            )
+            return event_time
+
+        logging.warning(
+            "[ReflectionAgent] eventTime not found in GCS file | gs://%s/%s",
+            _GCS_BUCKET,
+            _GCS_BLOB_PATH,
         )
+        return ""
+
     except Exception as e:
         logging.warning(
-            f"[{label}] POST FAILED | eventId={event_id} | "
-            f"url={url} | error={str(e)}"
+            "[ReflectionAgent] Failed to read eventTime from GCS | gs://%s/%s | error=%s",
+            _GCS_BUCKET,
+            _GCS_BLOB_PATH,
+            str(e),
+        )
+        return ""
+
+def _is_toolbox_running() -> bool:
+    """
+    Health check MCP Toolbox and verify query_tmf_node_changerequest tool exists.
+    """
+    if not _TOOLBOX_URL:
+        logging.warning("[ReflectionAgent][MCP] TOOLBOX_URL is empty")
+        return False
+
+    try:
+        resp = requests.post(
+            f"{_TOOLBOX_URL}/mcp",
+            headers={"Content-Type": "application/json"},
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {},
+            },
+            timeout=30,
         )
 
+        if 200 <= resp.status_code < 300:
+            body = resp.json()
+            tools = body.get("result", {}).get("tools", [])
+            tool_names = [t.get("name") for t in tools]
 
-# ── Retrigger payload builder ──────────────────────────────────────────────────
+            logging.info(
+                "[ReflectionAgent][MCP] Toolbox running at %s/mcp | tools=%s",
+                _TOOLBOX_URL,
+                tool_names,
+            )
 
-def _build_retrigger_failure_payload(
-    state:       dict,
-    exec_result: dict,
-    attempts:    int,
-) -> dict:
-    """Reconstruct a 2b-style FailureInjectionCreateEvent for ReflexAgent retrigger."""
-    original_event   = state.get(latest_key(EVT_FAILURE_NOTIFICATION), {})
-    original_payload = original_event.get("payload", {})
-    target_entities  = exec_result.get("target_entities", [])
-    domain = (
-        original_payload.get("domain")
-        or exec_result.get("domain")
-        or "RAN"
-    ).upper()
+            if MCP_TOOL_CHANGE_REQUEST not in tool_names:
+                logging.warning(
+                    "[ReflectionAgent][MCP] Required tool '%s' not found. Available tools=%s",
+                    MCP_TOOL_CHANGE_REQUEST,
+                    tool_names,
+                )
+                return False
 
-    affected_enodebs       = original_payload.get("affected_enodebs")
-    affected_core_elements = original_payload.get("affected_core_elements")
-    if affected_enodebs is None or affected_core_elements is None:
-        core_prefixes    = ("HSS", "MME", "AMF", "UPF", "SMF")
-        affected_enodebs = [
-            eid for eid in target_entities
-            if eid.upper().startswith(("ENB", "GNB"))
-        ]
-        affected_core_elements = [
-            eid for eid in target_entities
-            if eid.upper().startswith(core_prefixes)
-        ]
+            return True
 
-    affected_layers = original_payload.get("affected_layers")
-    if not affected_layers:
-        affected_layers = (
-            ["HSS", "MME", "eNodeB", "Hex Bin"]
-            if domain == "CORE"
-            else ["eNodeB", "Hex Bin"]
+        logging.warning(
+            "[ReflectionAgent][MCP] Health check returned HTTP %s | body=%s",
+            resp.status_code,
+            resp.text[:500],
         )
+        return False
 
-    base_event_id = (
-        original_payload.get("eventId")
-        or exec_result.get("eventId")
-        or "EV-RETRIGGER"
-    )
+    except Exception as e:
+        logging.warning(
+            "[ReflectionAgent][MCP] Health check failed | url=%s/mcp | error=%s",
+            _TOOLBOX_URL,
+            str(e),
+        )
+        return False
 
-    return {
-        "id":           f"{original_payload.get('id', 'retrigger')}-R{attempts}",
-        "eventId":      f"{base_event_id}-RETRY-{attempts}",
-        "eventTime":    datetime.now(timezone.utc).isoformat(),
-        "eventType":    original_payload.get("eventType", "FailureInjectionCreateEvent"),
-        "sourceSystem": "REFLECTION_AGENT",
-        "probableDomain": original_payload.get("probableDomain", "CROSS_DOMAIN"),
-        "trigger": (
-            original_payload.get("trigger")
-            or exec_result.get("root_cause")
-            or "reflection_retrigger"
-        ),
-        "useCaseId": original_payload.get(
-            "useCaseId",
-            "uc2" if domain == "CORE" else "uc1",
-        ),
-        "domain":                    domain,
-        "affected_layers":           affected_layers,
-        "affected_core_elements":    affected_core_elements or [],
-        "affected_enodebs":          affected_enodebs or [],
-        "affected_neighbor_enodebs": original_payload.get("affected_neighbor_enodebs", []),
+
+def _invoke_mcp_tool(tool_name: str, params: dict) -> list[dict]:
+    """
+    Invoke MCP Toolbox tool through JSON-RPC.
+    Expected tool: query_tmf_node_changerequest.
+    """
+    url = f"{_TOOLBOX_URL}/mcp"
+
+    rpc_payload = {
+        "jsonrpc": "2.0",
+        "id": f"reflection-{datetime.now(timezone.utc).isoformat()}",
+        "method": "tools/call",
+        "params": {
+            "name": tool_name,
+            "arguments": params,
+        },
     }
 
+    try:
+        resp = requests.post(
+            url,
+            headers={"Content-Type": "application/json"},
+            json=rpc_payload,
+            timeout=30,
+        )
+
+        if resp.status_code != 200:
+            logging.warning(
+                "[ReflectionAgent][MCP] %s returned HTTP %s | body=%s",
+                tool_name,
+                resp.status_code,
+                resp.text[:500],
+            )
+            return []
+
+        body = resp.json()
+
+        if "error" in body:
+            logging.warning(
+                "[ReflectionAgent][MCP] %s RPC error=%s",
+                tool_name,
+                body["error"],
+            )
+            return []
+
+        rows: list[dict] = []
+
+        for block in body.get("result", {}).get("content", []):
+            if block.get("type") == "text":
+                try:
+                    parsed = json.loads(block.get("text", ""))
+
+                    if isinstance(parsed, list):
+                        rows.extend(parsed)
+                    elif isinstance(parsed, dict):
+                        rows.append(parsed)
+
+                except json.JSONDecodeError:
+                    logging.warning(
+                        "[ReflectionAgent][MCP] Non-JSON text block from %s | text=%s",
+                        tool_name,
+                        block.get("text", "")[:200],
+                    )
+
+        logging.info(
+            "[ReflectionAgent][MCP] %s returned %s rows | params=%s",
+            tool_name,
+            len(rows),
+            json.dumps(params, default=str),
+        )
+
+        return rows
+
+    except Exception as e:
+        logging.warning(
+            "[ReflectionAgent][MCP] %s failed | error=%s",
+            tool_name,
+            str(e),
+        )
+        return []
+
+def _query_change_request_direct(
+    event_time: str,
+    change_request_id: str = "",
+) -> list[dict] | None:
+
+    if not event_time:
+        logging.warning("[ReflectionAgent] No event_time provided for Spanner CR query")
+        return None
+
+    from google.cloud import spanner as spanner_lib
+
+    client = spanner_lib.Client(project=_GCP_PROJECT)
+    instance = client.instance(_SPANNER_INSTANCE)
+    db = instance.database(_SPANNER_DATABASE)
+
+    rows_out: list[dict] = []
+
+    sql = """
+        SELECT
+          change_request_id,
+          event_time,
+          close_time,
+          status,
+          change_type_name,
+          risk_score,
+          reversibility_score
+        FROM tmf_node_changerequest
+        WHERE DATE(event_time) = DATE(TIMESTAMP(@event_time))
+    """
+
+    params = {
+        "event_time": event_time,
+    }
+
+    param_types = {
+        "event_time": spanner_lib.param_types.STRING,
+    }
+
+    if change_request_id:
+        sql += " AND change_request_id = @change_request_id"
+        params["change_request_id"] = change_request_id
+        param_types["change_request_id"] = spanner_lib.param_types.STRING
+
+    sql += " ORDER BY event_time DESC"
+
+    try:
+        with db.snapshot() as snap:
+            for row in snap.execute_sql(
+                sql,
+                params=params,
+                param_types=param_types,
+            ):
+                (
+                    cr_id,
+                    ev_time,
+                    close_time,
+                    status,
+                    change_type_name,
+                    risk_score,
+                    reversibility_score,
+                ) = row
+
+                rows_out.append({
+                    "change_request_id": cr_id,
+                    "event_time": ev_time,
+                    "close_time": close_time,
+                    "status": status,
+                    "change_type_name": change_type_name,
+                    "risk_score": float(risk_score) if risk_score is not None else None,
+                    "reversibility_score": (
+                        float(reversibility_score)
+                        if reversibility_score is not None
+                        else None
+                    ),
+                    "source": "spanner_direct",
+                })
+
+        logging.info(
+            "[ReflectionAgent] Spanner CR query returned %s rows | event_time=%s | change_request_id=%s",
+            len(rows_out),
+            event_time,
+            change_request_id,
+        )
+
+        return rows_out
+
+    except Exception as e:
+        logging.warning(
+            "[ReflectionAgent] Spanner CR query failed | event_time=%s | change_request_id=%s | error=%s",
+            event_time,
+            change_request_id,
+            str(e),
+        )
+        return None
+        
+        
+def _query_change_request_validation(
+    event_time: str,
+    target_entities: list[str] = None,
+) -> dict:
+    """
+    Validate that no change request remains for the original failure date.
+
+    Business rule:
+      - Failure injection creates a change_request_id in Spanner.
+      - Automation/Executor should clear/remove the change request after completion.
+      - Gate 2 PASS only when no change_request_id exists for the same GCS event date.
+      - If any row is returned for the same date, Gate 2 FAIL.
+      - If GCS eventTime is missing or validation query fails, Gate 2 FAIL.
+    """
+    target_entities = target_entities or []
+
+    # Safety guard: without GCS eventTime, Reflection cannot validate the date.
+    if not event_time:
+        result = {
+            "event_time_from_gcs": event_time,
+            "target_entities": target_entities,
+            "source": "missing_gcs_event_time",
+            "rows_found": 0,
+            "query_success": False,
+            "no_change_request_remaining": False,
+            "close_ok": False,
+            "rows": [],
+            "error": "GCS eventTime missing; cannot validate change request clearance",
+        }
+
+        logging.warning(
+            "[ReflectionAgent] Change request validation failed | %s",
+            json.dumps(result, default=str),
+        )
+
+        return result
+
+    rows: list[dict] = []
+    source = "none"
+    query_success = True
+
+    # Query by GCS event date only. 
+    if _is_toolbox_running():
+        rows = _invoke_mcp_tool(
+            MCP_TOOL_CHANGE_REQUEST,
+            {
+                "event_time": event_time,
+                "change_request_id": "",
+                "target_entities": target_entities,
+            },
+        )
+        source = "mcp_toolbox" if rows else "mcp_toolbox_empty"
+
+    # Fallback to direct Spanner when MCP returns no rows or MCP is unavailable.
+    if not rows:
+        direct_rows = _query_change_request_direct(
+            event_time=event_time,
+            change_request_id="",
+        )
+
+        if direct_rows is None:
+            rows = []
+            source = "spanner_direct_failed"
+            query_success = False
+        else:
+            rows = direct_rows
+            source = "spanner_direct" if rows else "spanner_direct_empty"
+
+    rows_found = len(rows)
+
+    # Gate 2 passes only when validation query succeeded and no CR rows remain.
+    no_change_request_remaining = query_success and rows_found == 0
+
+    result = {
+        "event_time_from_gcs": event_time,
+        "target_entities": target_entities,
+        "source": source,
+        "rows_found": rows_found,
+        "query_success": query_success,
+        "no_change_request_remaining": no_change_request_remaining,
+        "close_ok": no_change_request_remaining,
+        "rows": rows,
+    }
+
+    logging.info(
+        "[ReflectionAgent] Change request validation result | %s",
+        json.dumps(result, default=str),
+    )
+
+    return result
 
 # ── Tool 1: check_execution_result ────────────────────────────────────────────
 
@@ -359,21 +592,21 @@ def check_execution_result(tool_context: ToolContext) -> str:
     )
 
     # TMF921 intent — Doc2 schema
-    tmf921            = payload.get("tmf921_intent", {})
-    expressions       = tmf921.get("expressions", [])
-    target_entities   = tmf921.get("target_entities", [])
-    domain            = tmf921.get("domain", "UNKNOWN")
-    root_cause        = tmf921.get("root_cause", "")
-    priority          = tmf921.get("priority", "CRITICAL")
-    affected_hex_bins = (
-        payload.get("affected_hex_bins")
-        or tmf921.get("affected_hex_bins")
-        or []
-    )
+    tmf921 = payload.get("tmf921_intent", {}) 
+    expressions = (tmf921.get("expressions") or payload.get("expressions") or [])
+    target_entities = (payload.get("target_entities") or tmf921.get("target_entities") or [])
+    domain = (payload.get("domain") or tmf921.get("domain") or "UNKNOWN")
+    root_cause = (payload.get("root_cause") or tmf921.get("root_cause") or "")
+    priority = (payload.get("priority") or tmf921.get("priority") or "CRITICAL")
+    affected_hex_bins = (payload.get("affected_hex_bins") or tmf921.get("affected_hex_bins") or [])
 
     # TMF641 order — Doc2 schema
     tmf641      = payload.get("tmf641_order", {})
-    order_items = tmf641.get("order_items", [])
+    order_items = (
+        tmf641.get("order_items")
+        or tmf641.get("serviceOrderItem")
+        or []
+    )
     action_type = ""
     if order_items:
         svc   = order_items[0].get("service", {})
@@ -446,12 +679,15 @@ def evaluate_and_publish(tool_context: ToolContext) -> str:
     """
     Tool 2 of 2 — NO arguments.
 
-    Gate 1: execution_ok  [ACTIVE]   → success=True AND state="completed"
-    Gate 2: anomaly_label [DISABLED] → Spanner aw_base_hex07_anom (enable when ready)
-    Gate 3: is_degraded   [DISABLED] → Spanner performance        (enable when ready)
+    Gate 1:
+      execution_ok = success=True AND state="completed"
 
-    resolved = Gate1 only.
-    Z-score comparison removed — not required while Gate 1 is the only check.
+    Gate 2:
+      change request clearance validation from tmf_node_changerequest.
+      Uses eventTime from GCS and queries by DATE(event_time).
+      Gate 2 passes only when no change request remains for the same date.
+
+    resolved = gate1_ok AND gate2_cr_ok.
     """
     state       = tool_context.state
     exec_result = state.get("reflection_exec_result", {})
@@ -495,61 +731,71 @@ def evaluate_and_publish(tool_context: ToolContext) -> str:
                  "state": exec_result.get("state")},
     )
 
-    # ── Gate 2: Anomaly label  [COMMENTED OUT — enable when Spanner ready] ────
-    # gate2_ok = False
-    # labels   = []
-    # try:
-    #     h3_hex_bins      = affected_hex_bins or _resolve_hex_bins(target_entities)
-    #     gate2_ok, labels = _gate2_anomaly_label(h3_hex_bins)
-    # ...
-    # logging.info(f"[Step 10] Gate 2 — Anomaly Label | result=... | labels={labels}")
+    # ── Gate 2: Change Request Clearance Validation ───────────────────────
+    emit_step(
+        event_id,
+        "change_request_validation",
+        "running",
+        meta="Reading 2B eventTime from GCS and validating tmf_node_changerequest…",
+    )
 
-    # ── Gate 3: is_degraded  [COMMENTED OUT — enable when Spanner ready] ──────
-    # gate3_ok = False
-    # degraded = []
-    # try:
-    #     gate3_ok, degraded = _gate3_is_degraded(target_entities)
-    # ...
-    # logging.info(f"[Step 10] Gate 3 — is_degraded | result=... | degraded={degraded}")
+    gcs_event_time = _read_event_time_from_gcs()
+    cr_validation = _query_change_request_validation(
+        event_time=gcs_event_time,
+        target_entities=target_entities,
+    )
 
-    # ── Resolution  (add `and gate2_ok and gate3_ok` when gates are enabled) ──
-    resolved = gate1_ok
+    gate2_cr_ok = cr_validation.get("no_change_request_remaining", False)
 
-    max_attempts = REFLECTION_CONFIG["max_retrigger_attempts"]
-    attempts     = state.get("retrigger_count", 0)
+    emit_step(
+        event_id,
+        "change_request_validation",
+        "done" if gate2_cr_ok else "error",
+        meta=(
+            f"{'PASS' if gate2_cr_ok else 'FAIL'} · "
+            f"source={cr_validation.get('source')} · "
+            f"rows={cr_validation.get('rows_found')} · "
+            f"eventTime={gcs_event_time}"
+        ),
+        payload=cr_validation,
+    )
+    
+    resolved = gate1_ok and gate2_cr_ok
 
+    validation_failure_reason = None
+    
     if not resolved:
-        attempts += 1
-        state["retrigger_count"] = attempts
-
-    max_retries_reached = not resolved and attempts >= max_attempts
-    if max_retries_reached:
-        _log_10_max_retries(event_id, attempts, max_attempts)
-
-    retrigger_reason = None
-    if not resolved:
-        retrigger_reason = f"Execution failed: {exec_result.get('error', 'unknown')}"
+        if not gate1_ok:
+            validation_failure_reason = (
+                f"Execution gate failed: "
+                f"success={exec_result.get('success')} | "
+                f"state={exec_result.get('state')} | "
+                f"error={exec_result.get('error', 'unknown')}"
+            )
+        elif not gate2_cr_ok:
+            validation_failure_reason = (
+                "Change request validation failed: "
+                f"source={cr_validation.get('source')} | "
+                f"query_success={cr_validation.get('query_success')} | "
+                f"rows_found={cr_validation.get('rows_found')} | "
+                f"no_change_request_remaining={cr_validation.get('no_change_request_remaining')}"
+            )
+        else:
+            validation_failure_reason = "Validation failed"
+    
 
     topology_state    = _pick_topology_state(domain, resolved)
     business_view     = "UTILITY_SCORE_NORMAL"      if resolved else "UTILITY_SCORE_DEGRADED"
     service_view      = "KEI_NORMAL"                if resolved else "KEI_DEGRADED"
     gui_status        = "HEALTHY_ENVIRONMENT"       if resolved else "DEGRADED_ENVIRONMENT"
     gnn_topo_view     = "STABLE_ENVIRONMENT_GRAPH"  if resolved else "UNSTABLE_ENVIRONMENT_GRAPH"
-    validation_status = (
-        "IMO_COMPLIES"              if resolved
-        else "FAILED_AFTER_RETRIES" if max_retries_reached
-        else "RETRIGGER_INVESTIGATION"
-    )
-    next_network_status = (
-        "RESOLVED" if resolved
-        else "FAILED" if max_retries_reached
-        else "ANOMALY_DETECTED"
-    )
+    validation_status = ("IMO_COMPLIES" if resolved else "VALIDATION_FAILED")
+    next_network_status = ("RESOLVED" if resolved else "FAILED")
 
     # ── Step 10 resolution log ────────────────────────────────────────────────
     _log_10_resolution(
         event_id, resolved, gate1_ok,
-        retrigger_reason, validation_status, gui_status, topology_state,
+        validation_failure_reason, validation_status, gui_status, topology_state,
     )
     emit_step(
         event_id,
@@ -570,14 +816,14 @@ def evaluate_and_publish(tool_context: ToolContext) -> str:
             "reason": (
                 "Execution gate passed — network remediation confirmed"
                 if resolved
-                else retrigger_reason
+                else validation_failure_reason
             ),
         },
         "validation_gates": {
             "gate1_execution_ok": gate1_ok,
-            # gate2_anomaly_normal: None,   # not yet active
-            # gate3_not_degraded:   None,   # not yet active
+            "gate2_no_change_request_remaining": gate2_cr_ok,
         },
+        "change_request_validation": cr_validation,
         "execution_ok":      execution_ok,
         "execution_state":   exec_result.get("state"),
         "execution_error":   exec_result.get("error", ""),
@@ -593,15 +839,12 @@ def evaluate_and_publish(tool_context: ToolContext) -> str:
         "target_entities":   target_entities,
         "affected_hex_bins": affected_hex_bins,
         "recovery_targets":  exec_result.get("recovery_targets", []),
-        "retrigger_count":   attempts,
         "timestamp":         datetime.now(timezone.utc).isoformat(),
     }
 
     if not resolved:
-        validation_output["retrigger_reason"] = retrigger_reason
-        validation_output["next_target"] = (
-            None if max_retries_reached else "ReflexAgent"
-        )
+        validation_output["validation_failure_reason"] = validation_failure_reason
+        validation_output["next_target"] = None
 
     # ── Publish reflection.result on ADK event bus ────────────────────────────
     reflection_event = make_reflection_result_event(
@@ -612,40 +855,7 @@ def evaluate_and_publish(tool_context: ToolContext) -> str:
     reflection_event["network_status"] = next_network_status
     publish_event(state, reflection_event)
 
-    # ── POST to GUI dashboard (optional) ─────────────────────────────────────
-    reflection_payload = {
-        "status":       validation_output["status"],
-        "eventId":      event_id,
-        "resolved":     resolved,
-        "execution_ok": execution_ok,
-        "validation_gates": validation_output["validation_gates"],
-        "gui_dashboard": {
-            "business_view":  business_view,
-            "service_view":   service_view,
-            "gui_status":     gui_status,
-            "gnn_topology":   gnn_topo_view,
-            "topology_state": topology_state,
-        },
-        "tmf_metadata": {
-            "activation_id":   exec_result.get("activation_id"),
-            "intent_id":       exec_result.get("intent_id"),
-            "domain":          domain,
-            "target_entities": target_entities,
-        },
-        "retrigger": {
-            "attempt":      attempts,
-            "max_attempts": max_attempts,
-            "reason":       retrigger_reason,
-        },
-        "timestamp": validation_output["timestamp"],
-    }
-
-    _post_if_configured(
-        url      = f"{REFLECTION_AGENT_URL}/reflection-result" if REFLECTION_AGENT_URL else "",
-        payload  = reflection_payload,
-        label    = "Step 10 OUT ReflectionAgent → GUI/Orchestrator",
-        event_id = event_id,
-    )
+    
     emit_step(
         event_id,
         "published", "done",
@@ -654,23 +864,6 @@ def evaluate_and_publish(tool_context: ToolContext) -> str:
                  "network_status": next_network_status,
                  "activation_id": exec_result.get("activation_id", "")},
     )
-
-    # ── Retrigger pipeline if not resolved and under limit ────────────────────
-    if not resolved and not max_retries_reached:
-        retrigger_payload = _build_retrigger_failure_payload(state, exec_result, attempts)
-        publish_event(state, make_failure_notification_event(retrigger_payload))
-
-        _log_10_retrigger(
-            event_id, attempts, max_attempts,
-            retrigger_reason, retrigger_payload,
-        )
-
-        _post_if_configured(
-            url      = f"{REFLEX_AGENT_URL}/trigger_event" if REFLEX_AGENT_URL else "",
-            payload  = retrigger_payload,
-            label    = "Step 10 OUT ReflexAgent RETRIGGER",
-            event_id = event_id,
-        )
 
     state["reflection_output"] = validation_output
     state[NETWORK_STATUS_KEY]  = next_network_status

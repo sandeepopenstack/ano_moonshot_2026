@@ -1,6 +1,5 @@
 google-adk[vertexai]>=1.0.0
 google-cloud-bigquery>=3.11.0
 requests>=2.31.0
-a2a-sdk>=0.3.4,<0.4
 ./ran_healing_shared-0.1.0-py3-none-any.whl
 google-cloud-logging>=3.0.0

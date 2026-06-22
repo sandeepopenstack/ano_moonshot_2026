@@ -30,7 +30,6 @@ EXECUTOR_AGENT_URL = os.environ.get("EXECUTOR_AGENT_URL", "http://10.63.4.22:800
 # ══════════════════════════════════════════════════════════════════════════════
 # Natural language log helpers — MODULE LEVEL
 # ══════════════════════════════════════════════════════════════════════════════
-
 def _log_6_rca_received(rca: dict) -> None:
     """Step 6 — RCA payload received from Detective Agent."""
     event_id    = rca.get("eventId", "unknown")
@@ -90,6 +89,10 @@ def _log_7_utility_scoring(
     seq1_action = seq1.get("action", "unknown")
     seq1_domain = seq1.get("domain", rca.get("domain", "unknown"))
     seq1_util   = seq1.get("utility_score", 0.0)
+    seq1_impact = seq1.get("impact_score", impact)
+    seq1_criticality = seq1.get("criticality_score", criticality)
+    seq1_risk = seq1.get("risk_score", 0.0)
+    seq1_reversibility = seq1.get("reversibility_score", reversible)
 
     logging.info(
         f"[Step 7] Utility scoring complete for event '{event_id}'. "
@@ -102,8 +105,7 @@ def _log_7_utility_scoring(
         f"This is what the Executor will run first. "
         f"eventId={event_id} | branches={len(branches)} | "
         f"top_utility={top_utility} | utility_priority={utility_priority} | "
-        f"formula=impact({impact}) x criticality({criticality}) x (1-risk) x reversibility"
-    )
+        f"Formula for top branch: {seq1_impact} (impact) × "f"{seq1_criticality} (criticality) × "f"(1 − {seq1_risk}) × {seq1_reversibility} (reversibility). ")
     execution_order = [
         {
             "sequence":      b.get("sequence"),
@@ -147,32 +149,32 @@ def _log_7_tmf921_built(
 
 
 def _log_7_out_calling_executor(
-    rca:          dict,
+    rca: dict,
     executor_url: str,
-    intent_id:    str,
-    n_branches:   int,
+    intent_id: str,
+    branches: list,
 ) -> None:
     """Step 7 OUT — Calling ExecutorAgent."""
     event_id = rca.get("eventId", "unknown")
-    domain   = rca.get("domain", "unknown")
-    rc       = rca.get("root_cause", "unknown")
+    domain = rca.get("domain", "unknown")
+    priority = branches[0].get("utility_priority", "unknown") if branches else "unknown"
+    top_branch = branches[0] if branches else {}
 
-    action_desc = {
-        "antenna_tilt_misconfiguration": "roll back the antenna tilt parameter to its baseline",
-        "physical_fiber_cut_backhaul":   "reroute backhaul traffic to the redundant AGG path",
-        "hss_subscriber_db_saturation":  "clear stale HSS sessions and restore capacity",
-        "hss_stale_session_loop":        "clear stale HSS sessions",
-        "fiber_cut":                     "reroute backhaul to the redundant path",
-        "transport_path_failure":        "failover to the backup transport path",
-    }.get(rc.lower(), f"execute the {domain} remediation plan")
+    top_action = top_branch.get("action", "unknown")
+    top_target_entities = top_branch.get("target_entities", [])
+    top_param = top_branch.get("param", "")
+    top_direction = top_branch.get("direction", "")
+    n_branches = len(branches)
 
     logging.info(
         f"[Step 7 OUT] Handing the healing plan to the Executor for event '{event_id}'. "
-        f"Asking it to {action_desc}. "
+        f"Top-ranked action is '{top_action}' on {domain}. "
+        f"Targets: {top_target_entities}. "
+        f"Parameter: {top_param or 'n/a'}, direction: {top_direction or 'n/a'}. "
         f"Sending {n_branches} ranked {'branch' if n_branches == 1 else 'branches'} — "
-        f"it should start with sequence 1 and escalate only if needed. "
-        f"eventId={event_id} | url={executor_url} | "
-        f"intent_id={intent_id} | branch_count={n_branches}"
+        f"Executor should start with sequence 1 and escalate only if needed. "
+        f"eventId={event_id} | url={executor_url} | intent_id={intent_id} | "
+        f"priority={priority} | branch_count={n_branches}"
     )
 
 
@@ -185,17 +187,32 @@ def _log_7_out_executor_request(executor_payload: dict) -> None:
 
 def _log_7_out_executor_response(rca: dict, executor_response: dict) -> None:
     """Step 7 OUT — Executor response received."""
-    event_id   = rca.get("eventId", "unknown")
-    intent_id  = executor_response.get("intent_id", "unknown")
+    event_id = rca.get("eventId", "unknown")
+    intent_id = executor_response.get("intent_id", "unknown")
     exec_state = executor_response.get("state", "unknown")
+    success = bool(executor_response.get("success", False))
+    error = executor_response.get("error", "")
 
-    logging.info(
-        f"[Step 7 OUT] Executor accepted the healing plan for event '{event_id}'. "
-        f"Intent '{intent_id}' is now '{exec_state}'. "
-        f"The remediation is in progress — "
-        f"I'll publish the engineer.healing.plan.ready event and stand by for the Reflection Agent. "
-        f"eventId={event_id} | intent_id={intent_id} | state={exec_state}"
-    )
+    if success and str(exec_state).lower() == "completed":
+        logging.info(
+            f"[Step 7 OUT] Executor accepted and completed the healing plan for event '{event_id}'. "
+            f"Intent '{intent_id}' is now '{exec_state}'. "
+            f"The remediation execution completed successfully. "
+            f"Engineer will publish engineer.healing.plan.ready and Reflection can validate Gate 1. "
+            f"eventId={event_id} | intent_id={intent_id} | "
+            f"state={exec_state} | success={success}"
+        )
+    else:
+        logging.warning(
+            f"[Step 7 OUT] Executor failed the healing plan for event '{event_id}'. "
+            f"Intent '{intent_id}' is now '{exec_state}'. "
+            f"Executor error: {error or 'unknown'}. "
+            f"Engineer will not publish engineer.healing.plan.ready for this failed execution. "
+            f"Reflection Gate 1 would fail because execution success/state is not completed. "
+            f"eventId={event_id} | intent_id={intent_id} | "
+            f"state={exec_state} | success={success} | error={error}"
+        )
+
     logging.info(
         f"[Step 7 OUT] Executor Response Payload | "
         f"{json.dumps(executor_response, default=str)}"
@@ -253,6 +270,41 @@ def _build_intent_id(rca: dict) -> str:
         return f"INTENT-{rca['eventId']}"
     return "INTENT-UNKNOWN"
 
+# ── Build Action command per branch ───────────────────────────────────────── 
+def _build_action_command(suggestion: dict,causal_params: dict) -> dict:
+    """
+    Parse Detective Agent RCA payload (investigation.rca.confirmed).
+    All scores sourced from Detective Agent — no domain knowledge here.
+    """
+    action = suggestion.get("action", "")
+
+    # No concrete command
+    if action == "accept_degradation" or not action:
+        return {
+            "action":    action or "no_action",
+            "parameter_name":       None,
+            "current_value":        None,
+            "target_value":         None,
+            "direction":            "no_action",
+            "target_entity":        None,
+        }
+
+    # Concrete command
+    # 1. suggestion.value if detective provided it
+    # 2. else causal_parameters.previous_value
+
+    target_value = suggestion.get("value")
+    if target_value is None:
+        target_value = causal_params.get("previous_value")
+
+    return {
+        "action":      action,
+        "parameter_name": suggestion.get("param") or causal_params.get("parameter",""),
+        "current_value":  causal_params.get("current_value"),
+        "target_value":   target_value,
+        "direction":      suggestion.get("direction", ""),
+        "target_entity":   suggestion.get("target", ""),
+    }
 
 # ── Parse Detective Agent RCA payload ─────────────────────────────────────────
 
@@ -273,13 +325,14 @@ def _parse_rca(raw: dict) -> dict:
         "hypothesis_id":          raw.get("hypothesis_id", ""),
         "change_request_id":      raw.get("change_request_id", ""),
         "incident_type":          raw.get("incident_type", ""),
+        "ranked_list": raw.get("ranked_list", []),
         "root_cause":             raw.get("root_cause", ""),
         "root_cause_description": raw.get("root_cause_description", ""),
         "timestamp_of_cause":     raw.get("timestamp_of_cause", ""),
         "domain":                 raw.get("domain", "UNKNOWN"),
         "confidence_label":       raw.get("confidence", ""),
         "confidence_score":       float(raw.get("confidence_score", 0.0)),
-        "affected_entities":      raw.get("affected_entities", []),
+        "affected_entities":      raw.get("affected_entities",raw.get("entity_ids", [])),
         "neighbor_entities":      raw.get("neighbor_entities", []),
         "affected_cells":         raw.get("affected_cells", []),
         "affected_hex_bins":      raw.get("affected_hex_bins", []),
@@ -309,6 +362,96 @@ def _parse_rca(raw: dict) -> dict:
         "change_type_name":       raw.get("change_type_name", "UNKNOWN"),
     }
 
+def _build_ranked_entity_index(ranked_list: list[dict]) -> dict:
+    """
+    Build lookup index from Reflex/Detective ranked_list.
+
+    entity_id -> impact_score, criticality_score, criticality_label, domain, rank
+    """
+    entity_index = {}
+
+    for item in ranked_list or []:
+        entity_id = item.get("entity_id") or item.get("eid") or item.get("node_id")
+        if not entity_id:
+            continue
+
+        entity_index[entity_id] = {
+            "rank": item.get("rank"),
+            "domain": item.get("domain", "UNKNOWN"),
+            "priority_flag": item.get("priority_flag", ""),
+            "impact_score": float(item.get("impact_score", 0.0)),
+            "criticality_score": float(item.get("criticality_score", 0.0)),
+            "criticality_label": item.get("criticality_label", "UNKNOWN"),
+        }
+
+    return entity_index
+
+
+def _resolve_branch_scores(
+    branch_or_suggestion: dict,
+    rca: dict,
+    entity_index: dict,
+) -> dict:
+    """
+    Resolve branch impact/criticality using source_entity.
+
+    Priority:
+    1. source_entity from Detective suggestion/branch
+    2. target if target exists in ranked_list
+    3. rank-1 entity from ranked_list
+    4. top-level RCA fallback
+    """
+    source_entity = branch_or_suggestion.get("source_entity", "")
+    target_entity = branch_or_suggestion.get("target", "")
+    
+    target_entities = branch_or_suggestion.get("target_entities", [])
+    if isinstance(target_entities, str):
+        target_entities = [target_entities]
+    
+    lookup_entity = source_entity
+    
+    if not lookup_entity and target_entity in entity_index:
+        lookup_entity = target_entity
+    
+    if not lookup_entity:
+        for target_candidate in target_entities:
+            if target_candidate in entity_index:
+                lookup_entity = target_candidate
+                break
+    
+
+    if not lookup_entity and rca.get("ranked_list"):
+        top_ranked = rca["ranked_list"][0]
+        lookup_entity = (
+            top_ranked.get("entity_id")
+            or top_ranked.get("eid")
+            or top_ranked.get("node_id", "")
+        )
+
+    scores = entity_index.get(lookup_entity, {})
+
+    return {
+        "source_entity": lookup_entity,
+        "impact_score": float(
+            branch_or_suggestion.get(
+                "impact_score",
+                scores.get("impact_score", rca["impact_score"])
+            )
+        ),
+        "criticality_score": float(
+            branch_or_suggestion.get(
+                "criticality_score",
+                scores.get("criticality_score", rca["criticality_score"])
+            )
+        ),
+        "criticality_label": branch_or_suggestion.get(
+            "criticality_label",
+            scores.get("criticality_label", rca["criticality_label"])
+        ),
+        "source_domain": scores.get("domain", rca.get("domain", "UNKNOWN")),
+        "source_rank": scores.get("rank"),
+        "source_priority_flag": scores.get("priority_flag", ""),
+    }
 
 # ── Build utility-scored branches ──────────────────────────────────────────────
 
@@ -326,8 +469,6 @@ def _build_branches(rca: dict) -> list[dict]:
 
     Single-domain (suggested_remediation from Detective):
       Option A: base risk → highest utility → seq 1
-      Option B: risk + 0.10 → lower utility → seq 2
-      Option C (accept_degradation): risk + 0.30 penalty → always last
 
     Sequence assigned AFTER sort — pure utility math, no hardcoding.
     """
@@ -337,12 +478,33 @@ def _build_branches(rca: dict) -> list[dict]:
     base_reversibility = rca["reversibility_score"]
     branches: list[dict] = []
 
+    entity_index = _build_ranked_entity_index(rca.get("ranked_list", []))
+
     # ── Cross-domain: 1 branch per domain from Detective confirmedRcaBranches ──
     if rca["confirmed_rca_branches"]:
         for branch in rca["confirmed_rca_branches"]:
-            b_risk       = float(branch.get("risk_score", base_risk))
-            b_reversible = float(branch.get("reversibility", base_reversibility))
-            utility      = _compute_utility(impact_score, criticality_score, b_risk, b_reversible)
+
+            branch_scores = _resolve_branch_scores(branch, rca, entity_index,)
+            b_impact = branch_scores["impact_score"]
+            b_criticality = branch_scores["criticality_score"]
+            b_criticality_label = branch_scores["criticality_label"]
+            source_entity = branch_scores["source_entity"]
+            
+            b_risk = float(branch.get("risk_score", base_risk))
+            b_reversible = float(
+                branch.get(
+                    "reversibility_score",
+                    branch.get("reversibility", base_reversibility)
+                )
+            )
+            
+            utility = _compute_utility(
+                b_impact,
+                b_criticality,
+                b_risk,
+                b_reversible,
+            )
+            
             branches.append({
                 "domain":              branch.get("domain", rca["domain"]),
                 "root_cause":          branch.get("root_cause", rca["root_cause"]),
@@ -356,27 +518,63 @@ def _build_branches(rca: dict) -> list[dict]:
                 "direction":           branch.get("direction", ""),
                 "risk_score":          b_risk,
                 "reversibility_score": b_reversible,
-                "impact_score":        impact_score,
-                "criticality_score":   criticality_score,
+                "source_entity":       source_entity,
+                "source_rank":         branch_scores.get("source_rank"),
+                "source_priority_flag":branch_scores.get("source_priority_flag", ""),
+                "impact_score":        b_impact,
+                "criticality_score":   b_criticality,
+                "criticality_label":   b_criticality_label,
                 "utility_score":       utility,
                 "utility_priority":    _priority_from_utility(utility),
                 "action_source":       "detective_confirmed_rca_branches",
                 "priority_score":      float(branch.get("priority_score", 10)),
+                "action_command":      _build_action_command(branch, branch.get("causal_parameters", rca["causal_parameters"])),
             })
 
     # ── Single-domain: 1 branch per suggested_remediation option ───────────────
     elif rca["suggested_remediation"]:
         for idx, suggestion in enumerate(rca["suggested_remediation"]):
-            option_risk = min(base_risk + (0.10 * idx), 1.0)
-            is_noop     = suggestion.get("action") == "accept_degradation"
+    
+            branch_scores = _resolve_branch_scores(
+                suggestion,
+                rca,
+                entity_index,
+            )
+    
+            branch_impact_score = branch_scores["impact_score"]
+            branch_criticality_score = branch_scores["criticality_score"]
+            branch_criticality_label = branch_scores["criticality_label"]
+            source_entity = branch_scores["source_entity"]
+    
+            # Risk and reversibility are branch-level values from Detective.
+            option_risk = float(
+                suggestion.get("risk_score", base_risk)
+            )
+    
+            branch_reversibility = float(
+                suggestion.get("reversibility_score", base_reversibility)
+            )
+    
+            is_noop = suggestion.get("action") == "accept_degradation"
+
+            # Guardrail: do not allow accept_degradation/no-op to rank first
+            # when Detective sends risk_score=0.0 and reversibility_score=1.0.
             if is_noop:
-                option_risk = min(option_risk + 0.20, 1.0)
-            utility = _compute_utility(impact_score, criticality_score, option_risk, base_reversibility)
+                option_risk = max(option_risk, 0.9)
+            
+            utility = _compute_utility(
+                branch_impact_score,
+                branch_criticality_score,
+                option_risk,
+                branch_reversibility,
+            )
+    
             target_entities = (
                 [suggestion["target"]]
                 if suggestion.get("target")
                 else rca["affected_entities"]
             )
+    
             branches.append({
                 "domain":              rca["domain"],
                 "root_cause":          rca["root_cause"],
@@ -385,19 +583,32 @@ def _build_branches(rca: dict) -> list[dict]:
                 "action_detail":       "",
                 "description":         suggestion.get("note", ""),
                 "target_entities":     target_entities,
+    
+                # Important: source entity is impacted/root entity used for scoring.
+                "source_entity":       source_entity,
+                "source_rank":         branch_scores.get("source_rank"),
+                "source_priority_flag": branch_scores.get("source_priority_flag", ""),
+    
                 "param":               suggestion.get("param", ""),
                 "value":               suggestion.get("value"),
                 "direction":           suggestion.get("direction", ""),
                 "causal_parameters":   rca["causal_parameters"],
                 "is_noop":             is_noop,
+    
+                # Utility inputs
                 "risk_score":          option_risk,
-                "reversibility_score": base_reversibility,
-                "impact_score":        impact_score,
-                "criticality_score":   criticality_score,
+                "reversibility_score": branch_reversibility,
+                "impact_score":        branch_impact_score,
+                "criticality_score":   branch_criticality_score,
+                "criticality_label":   branch_criticality_label,
+    
+                # Utility output
                 "utility_score":       utility,
                 "utility_priority":    _priority_from_utility(utility),
+    
                 "action_source":       "detective_suggested_remediation",
                 "priority_score":      float(10 - idx),
+                "action_command":      _build_action_command(suggestion, rca["causal_parameters"],),
             })
 
     # ── Fallback: no remediation options from Detective Agent ──────────────────
@@ -423,6 +634,12 @@ def _build_branches(rca: dict) -> list[dict]:
             "utility_priority":    _priority_from_utility(utility),
             "action_source":       "fallback",
             "priority_score":      10.0,
+            "action_command":      {
+                "action": "MANUAL_INVESTIGATION_REQUIRED",
+                "parameter_name": None, "current_value": None,
+                "target_value": None, "direction": "manual",
+                "target_entity": None,
+            },
         })
 
     # Sort descending by utility → assign sequence AFTER sort
@@ -494,6 +711,7 @@ def _build_tmf921_intent(
                 "utility_priority":    b["utility_priority"],
                 "risk_score":          b["risk_score"],
                 "reversibility_score": b["reversibility_score"],
+                "action_command":      b.get("action_command", {}),
             }
             for b in branches
         ],
@@ -635,6 +853,7 @@ def generate_healing_plan(tool_context: ToolContext) -> dict:
                 "risk_score":          b["risk_score"],
                 "reversibility_score": b["reversibility_score"],
                 "utility_score":       b["utility_score"],
+                "action_command":      b.get("action_command", {}),
             }
             for b in branches
         ],
@@ -652,7 +871,7 @@ def generate_healing_plan(tool_context: ToolContext) -> dict:
     executor_url = f"{EXECUTOR_AGENT_URL}/execute-healing-plan"
 
     # ── Step 7 OUT log: calling Executor ──────────────────────────────────────
-    _log_7_out_calling_executor(rca, executor_url, intent_id, len(branches))
+    _log_7_out_calling_executor(rca, executor_url, intent_id, branches)
     _log_7_out_executor_request(executor_payload)
     emit_step(
         rca.get("eventId", ""),
@@ -662,33 +881,87 @@ def generate_healing_plan(tool_context: ToolContext) -> dict:
     )
 
     try:
-        response = requests.post(executor_url, json=executor_payload, timeout=60)
+        response = requests.post(executor_url, json=executor_payload, timeout=180)
         response.raise_for_status()
         executor_response = response.json()
-
+    
+        executor_success = bool(executor_response.get("success", False))
+        executor_state = str(executor_response.get("state", "")).lower()
+    
+        if not executor_success or executor_state != "completed":
+            _log_7_out_executor_response(rca, executor_response)
+    
+            emit_step(
+                rca.get("eventId", ""),
+                "executor_called",
+                "error",
+                meta=(
+                    f"FAILED: intent={executor_response.get('intent_id', intent_id)} · "
+                    f"state={executor_response.get('state', '')} · "
+                    f"error={executor_response.get('error', '')}"
+                ),
+                payload={
+                    "intent_id": executor_response.get("intent_id", intent_id),
+                    "activation_id": executor_response.get("activation_id", ""),
+                    "state": executor_response.get("state", ""),
+                    "success": executor_response.get("success", False),
+                    "error": executor_response.get("error", ""),
+                },
+            )
+    
+            state["executor_response"] = executor_response
+            state[NETWORK_STATUS_KEY] = "FAILED"
+    
+            return {
+                "status": "EXECUTOR_FAILED",
+                "eventId": rca["eventId"],
+                "intent_id": executor_response.get("intent_id", intent_id),
+                "executor_state": executor_response.get("state", ""),
+                "executor_success": executor_response.get("success", False),
+                "error": executor_response.get("error", ""),
+                "network_status": "FAILED",
+            }
+    
         # ── Step 7 OUT log: Executor response ─────────────────────────────────
         _log_7_out_executor_response(rca, executor_response)
+    
         emit_step(
             rca.get("eventId", ""),
-            "executor_called", "done",
-            meta=(f"intent={executor_response.get('intent_id', intent_id)} · "
-                  f"activation={executor_response.get('activation_id','')} · "
-                  f"state={executor_response.get('state','?')}"),
-            payload={"intent_id": executor_response.get("intent_id", intent_id),
-                     "activation_id": executor_response.get("activation_id", ""),
-                     "state": executor_response.get("state", "")},
+            "executor_called",
+            "done",
+            meta=(
+                f"intent={executor_response.get('intent_id', intent_id)} · "
+                f"activation={executor_response.get('activation_id','')} · "
+                f"state={executor_response.get('state','?')}"
+            ),
+            payload={
+                "intent_id": executor_response.get("intent_id", intent_id),
+                "activation_id": executor_response.get("activation_id", ""),
+                "state": executor_response.get("state", ""),
+                "success": executor_response.get("success", False),
+            },
         )
-
+    
         state["executor_response"] = executor_response
-
+    
     except Exception as e:
         logging.exception(
             f"[Step 7 OUT] ExecutorAgent call FAILED | "
             f"eventId={rca['eventId']} | url={executor_url} | error={str(e)}"
         )
-        emit_step(rca.get("eventId", ""), "executor_called", "error",
-            meta=f"FAILED: {str(e)}")
-        return {"status": "EXECUTOR_CALL_FAILED", "error": str(e)}
+        emit_step(
+            rca.get("eventId", ""),
+            "executor_called",
+            "error",
+            meta=f"FAILED: {str(e)}",
+        )
+        state[NETWORK_STATUS_KEY] = "FAILED"
+        return {
+            "status": "EXECUTOR_CALL_FAILED",
+            "eventId": rca["eventId"],
+            "error": str(e),
+            "network_status": "FAILED",
+        }
 
     # ── Publish event on internal ADK bus ─────────────────────────────────────
     engineer_output = {
